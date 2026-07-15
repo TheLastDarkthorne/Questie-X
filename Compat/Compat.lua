@@ -1080,6 +1080,14 @@ local questTagToName = {
     [85] = "Heroic",
 }
 
+-- Reverse lookup (tag name -> tag id), exposed so callers can convert the live
+-- questTag string returned by the game's own GetQuestLogTitle back into the
+-- numeric tag id used throughout Questie.
+QuestieCompat.QuestTagNameToId = {}
+for id, name in pairs(questTagToName) do
+    QuestieCompat.QuestTagNameToId[name] = id
+end
+
 -- Retrieves tag information about the quest.
 -- https://wowpedia.fandom.com/wiki/API_GetQuestTagInfo
 function QuestieCompat.GetQuestTagInfo(questId)

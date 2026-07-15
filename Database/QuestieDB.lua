@@ -999,6 +999,25 @@ end
 ---@param questId number
 ---@return number|nil questType, string|nil questTag
 function QuestieDB.GetQuestTagInfo(questId)
+    -- Prefer the server's own live tag over static data whenever the quest is currently in
+    -- the quest log. Custom servers can reuse a Blizzard quest ID for different content (e.g.
+    -- Ascension's "Bride of the Embalmer" reusing ID 253, which Questie's static QuestTag.lua
+    -- correctly marks as non-group for retail's real quest 253), which the static tables below
+    -- have no way to know about. The live tag is authoritative once available, whether that
+    -- means it HAS a tag the static data misses, or has NO tag the static data wrongly assumes.
+    local cachedQuest = QuestLogCache.questLog_DO_NOT_MODIFY[questId]
+    if cachedQuest then
+        local liveTag = cachedQuest.questTag
+        if liveTag then
+            local liveTagId = QuestieCompat.QuestTagNameToId[liveTag]
+            if liveTagId then
+                return liveTagId, liveTag
+            end
+        else
+            return nil, nil
+        end
+    end
+
     if questTagCorrections[questId] then
         return questTagCorrections[questId][1], questTagCorrections[questId][2]
     end
