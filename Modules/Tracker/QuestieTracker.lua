@@ -1030,6 +1030,13 @@ function QuestieTracker:Update()
                                 questName = questName .. " (" .. quest.Id .. ")"
                             end
                             coloredQuestName = "|cFFFFFF00" .. questName .. "|r"
+                            -- Fallback quests (e.g. custom server quests not in QuestieDB) skip
+                            -- GetColoredQuestName entirely since it needs a DB name lookup, so they
+                            -- never got the (Complete) suffix DB quests get under the same setting.
+                            if Questie.db.profile.collapseCompletedQuests and isMinimizable then
+                                coloredQuestName = coloredQuestName .. " " ..
+                                    Questie:Colorize("(" .. l10n("Complete") .. ")", "green")
+                            end
                         elseif timedQuest then
                             coloredQuestName = QuestieLib:GetColoredQuestName(quest.Id,
                                 Questie.db.profile.trackerShowQuestLevel, false, false)
@@ -1037,6 +1044,32 @@ function QuestieTracker:Update()
                             coloredQuestName = QuestieLib:GetColoredQuestName(quest.Id,
                                 Questie.db.profile.trackerShowQuestLevel,
                                 (Questie.db.profile.collapseCompletedQuests and isMinimizable), false)
+                        end
+
+                        if not coloredQuestName then
+                            -- QuestieDB has no "name" entry for this quest (e.g. a custom
+                            -- server quest not yet in the static DB), so GetColoredQuestName
+                            -- returned nil -- fall back instead of SetText(nil) blanking the
+                            -- title line while its objectives still render normally below it.
+                            -- Use the live quest object's own level (kept in sync by
+                            -- QuestieQuest:PopulateQuestLogInfo) instead of QuestieLib.GetTbcLevel,
+                            -- which queries the static DB only: for a quest with no DB entry it
+                            -- silently defaults to level 1, and custom server level scaling then
+                            -- scales that wrong base instead of the quest's real level.
+                            local fallbackName = quest.name or tostring(quest.Id)
+                            if Questie.db.profile.trackerShowQuestLevel and quest.level and quest.level > 0 then
+                                fallbackName = QuestieLib:GetQuestString(quest.Id, fallbackName, quest.level, false)
+                            end
+                            if Questie.db.profile.enableTooltipsQuestID then
+                                fallbackName = fallbackName .. " (" .. quest.Id .. ")"
+                            end
+                            coloredQuestName = "|cFFFFFF00" .. fallbackName .. "|r"
+                            -- Same suffix rule as the normal (DB) branch -- GetColoredQuestName
+                            -- never got a chance to run since it bailed out on the missing name.
+                            if Questie.db.profile.collapseCompletedQuests and isMinimizable then
+                                coloredQuestName = coloredQuestName .. " " ..
+                                    Questie:Colorize("(" .. l10n("Complete") .. ")", "green")
+                            end
                         end
 
                         line.label:SetText(coloredQuestName)

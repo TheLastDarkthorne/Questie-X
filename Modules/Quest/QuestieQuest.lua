@@ -1,5 +1,6 @@
 --- COMPATIBILITY ---
 local IsQuestFlaggedCompleted = QuestieCompat.IsQuestFlaggedCompleted or C_QuestLog.IsQuestFlaggedCompleted
+local GetQuestLogTitle = QuestieCompat.GetQuestLogTitle
 
 ---@class QuestieQuest
 local QuestieQuest = QuestieLoader:CreateModule("QuestieQuest")
@@ -2302,6 +2303,24 @@ function QuestieQuest:PopulateQuestLogInfo(quest)
         if quest.WasComplete then
             quest.WasComplete = nil
             Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestieQuest:PopulateQuestLogInfo] Cleared stale WasComplete for quest:", quest.Id)
+        end
+    end
+
+    -- Sync level with the live quest log. QuestieDB.GetQuest permanently caches quest
+    -- objects (Database/QuestieDB.lua:1752 `if _QuestieDB.questCache[questId] then return
+    -- ... end`), so quest.level is otherwise frozen at whatever value was computed the
+    -- first time this quest was cached. QuestLogCache.questLog_DO_NOT_MODIFY doesn't carry
+    -- a level field at all, so read it straight from GetQuestLogTitle. On servers with
+    -- dynamic quest level scaling, the effective level can change after caching (player
+    -- level-up, scaling option toggled), so re-sync it here every time.
+    if GetQuestLogTitle then
+        local questIndex = GetQuestLogIndexByID and GetQuestLogIndexByID(quest.Id)
+        if questIndex and questIndex > 0 then
+            local _, liveLevel = GetQuestLogTitle(questIndex)
+            if liveLevel and liveLevel > 0 and liveLevel ~= quest.level then
+                quest.level = liveLevel
+                quest.questLevel = liveLevel
+            end
         end
     end
 

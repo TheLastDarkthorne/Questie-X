@@ -379,8 +379,14 @@ function TrackerUtils:GetCompletionText(quest)
 
     if completionText then
         return completionText
-    else
+    elseif quest.Description and quest.Description[1] then
         return quest.Description[1]:gsub("%.", "")
+    else
+        -- Fallback/custom quests (e.g. server quests not in QuestieDB) have no
+        -- top-level Description array. Without this, indexing quest.Description[1]
+        -- throws and aborts the whole tracker render for that quest via the
+        -- caller's pcall, freezing its line on the last successful render.
+        return nil
     end
 end
 
