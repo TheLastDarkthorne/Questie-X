@@ -46,6 +46,7 @@ local QuestieDebugOffer = QuestieLoader:ImportModule("QuestieDebugOffer")
 local C_Timer = QuestieCompat.C_Timer
 local GetQuestLogTitle = QuestieCompat.GetQuestLogTitle
 local GetQuestLogIndexByID = QuestieCompat.GetQuestLogIndexByID
+local GetQuestLogSpecialItemInfo = QuestieCompat.GetQuestLogSpecialItemInfo
 local GetItemInfo = QuestieCompat.GetItemInfo
 local function GetNumLines(label)
     if label.GetNumLines then
@@ -1094,6 +1095,26 @@ function QuestieTracker:Update()
 
                         local usableQIB = false
                         local sourceItemId = QuestieDB.QueryQuestSingle(quest.Id, "sourceItemId")
+                        local isLiveSourceItem = false
+
+                        if not sourceItemId or sourceItemId == 0 then
+                            -- QuestieDB has no data for this quest (e.g. a custom server quest).
+                            -- Ask the client directly which item, if any, it considers this quest's
+                            -- usable "special item" instead of relying on static DB data that
+                            -- simply doesn't exist for quests Questie doesn't know about.
+                            local questLogIndex = GetQuestLogIndexByID and GetQuestLogIndexByID(quest.Id)
+                            if questLogIndex and questLogIndex > 0 and GetQuestLogSpecialItemInfo then
+                                local link = GetQuestLogSpecialItemInfo(questLogIndex)
+                                local liveItemId = link and tonumber(link:match("item:(%d+)"))
+                                if liveItemId then
+                                    sourceItemId = liveItemId
+                                    isLiveSourceItem = true
+                                    quest.sourceItemId = liveItemId
+                                end
+                            end
+                        end
+
+                        quest._liveSourceItem = isLiveSourceItem
                         local sourceItem = sourceItemId and TrackerUtils:IsQuestItemUsable(sourceItemId)
                         local requiredItems = quest.requiredSourceItems
                         local requiredItem = requiredItems and TrackerUtils:IsQuestItemUsable(requiredItems[1])

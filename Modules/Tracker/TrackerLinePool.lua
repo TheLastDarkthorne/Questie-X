@@ -504,7 +504,11 @@ function TrackerLinePool.Initialize(questFrame)
 
             -- Check primary source item
             if quest.sourceItemId and quest.sourceItemId ~= 0 and buttonType == "primary" then
-                if QuestieDB.QueryItemSingle(quest.sourceItemId, "class") == 12 and GetItemCount(quest.sourceItemId, false, false) > 0 then
+                -- For quests QuestieDB has no data on, sourceItemId was resolved live via
+                -- GetQuestLogSpecialItemInfo -- the client already vetted it as the quest's
+                -- special item, so the static-DB item class isn't known/needed here.
+                local isQuestItem = quest._liveSourceItem or QuestieDB.QueryItemSingle(quest.sourceItemId, "class") == 12
+                if isQuestItem and GetItemCount(quest.sourceItemId, false, false) > 0 then
                     foundItemId = quest.sourceItemId
                 end
             end
