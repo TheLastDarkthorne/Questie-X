@@ -676,27 +676,37 @@ local function GetAreaIdByZoneName(zoneName)
     return l10n:GetAreaIdByLocalName(zoneName)
 end
 
--- Walk the quest log to find the zone header for a given questId.
--- In 3.3.5, zone names appear as isHeader=true entries above their quests.
--- Returns the header title string, or nil if not found.
+-- questId -> the header the client filed it under in the quest log. In 3.3.5 those headers are
+-- isHeader=true entries sitting above the quests they cover. Built in one pass and kept, because
+-- the tracker asks per quest and redraws often -- walking the log once per quest is quadratic.
+local questLogHeaders = {}
+
+local function BuildQuestLogHeaders()
+    local headers = {}
+    local header
+
+    for i = 1, (GetNumQuestLogEntries and GetNumQuestLogEntries() or 0) do
+        local title, _, _, isHeader, _, _, _, logId = GetQuestLogTitle(i)
+        if isHeader then
+            if title and title ~= "" then
+                header = title
+            end
+        elseif logId and header then
+            headers[logId] = header
+        end
+    end
+
+    questLogHeaders = headers
+end
+
+-- Returns the header title string, or nil if the quest is not in the log under one.
 local function GetQuestLogZoneName(questId)
-    local targetIndex = nil
-    local total = GetNumQuestLogEntries and GetNumQuestLogEntries() or 0
-    for i = 1, total do
-        local _, _, _, isHeader, _, _, _, logId = GetQuestLogTitle(i)
-        if not isHeader and logId == questId then
-            targetIndex = i
-            break
-        end
+    if not questLogHeaders[questId] then
+        -- Asked about a quest the last pass did not see, so the log has moved on since.
+        BuildQuestLogHeaders()
     end
-    if not targetIndex then return nil end
-    for i = targetIndex, 1, -1 do
-        local title, _, _, isHeader = GetQuestLogTitle(i)
-        if isHeader and title and title ~= "" then
-            return title
-        end
-    end
-    return nil
+
+    return questLogHeaders[questId]
 end
 
 local function _GetZoneName(zoneOrSort, questId, zoneNameOverride)
@@ -707,6 +717,19 @@ local function _GetZoneName(zoneOrSort, questId, zoneNameOverride)
     local zoneName
     local sortObj = Questie.db.profile.trackerSortObjectives
     if sortObj == "byZone" or sortObj == "byZonePlayerProximity" or sortObj == "byZonePlayerProximityReversed" then
+        -- A server can file quests under categories of its own -- e.g. a custom "Main Quest"
+        -- header -- and those exist nowhere in the zone tables, so the quest data points at a
+        -- zone instead: for anything the Learner recorded, whichever zone it was picked up in. A
+        -- header that does not resolve to an area is one of those categories, and the client's
+        -- own grouping is the only thing that knows about it.
+        local logHeader = GetQuestLogZoneName(questId)
+        if logHeader and logHeader ~= "" then
+            local headerAreaId = GetAreaIdByZoneName(logHeader)
+            if (not headerAreaId) or headerAreaId == 0 then
+                return logHeader
+            end
+        end
+
         if (zoneOrSort) > 0 then
             zoneName = TrackerUtils:GetZoneNameByID(zoneOrSort)
             if not zoneName or zoneName == "Unknown Zone" then
@@ -813,6 +836,9 @@ function TrackerUtils:GetSortedQuestIds()
     local sortedQuestIds = {}
     local questDetails = {}
     local sortObj = Questie.db.profile.trackerSortObjectives
+
+    -- One walk of the quest log for the whole draw, so the per-quest zone lookups below are reads.
+    BuildQuestLogHeaders()
     -- Update quest objectives
 
     for questId, quest in pairs(QuestiePlayer.currentQuestlog) do
