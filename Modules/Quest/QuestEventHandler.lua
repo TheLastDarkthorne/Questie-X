@@ -538,6 +538,10 @@ function _QuestEventHandler:QuestLogUpdate()
         doFullQuestLogScan = false
         -- Function call updates doFullQuestLogScan. Order matters.
         _QuestEventHandler:UpdateAllQuests()
+        -- Also on this path: UpdateAllQuests only looks at quests still in the log, so a removal
+        -- that fired no event of its own would sit there unnoticed for as long as full scans keep
+        -- being asked for.
+        _QuestEventHandler:CleanupRemovedQuestsFallback()
     else
         _QuestEventHandler:CleanupRemovedQuestsFallback()
         QuestieCombatQueue:Queue(function()
@@ -651,7 +655,9 @@ function _QuestEventHandler:CleanupRemovedQuestsFallback()
     if QuestiePlayer and QuestiePlayer.currentQuestlog then
         local removedQuestIds = {}
         for questId in pairs(QuestiePlayer.currentQuestlog) do
-            if questId and questId > 0 and (not gameQuestIds[questId]) then
+            -- Typed check: a stray string key (saved variables have produced them) would other-
+            -- wise error on the comparison and take the whole pass down with it.
+            if type(questId) == "number" and questId > 0 and (not gameQuestIds[questId]) then
                 removedQuestIds[#removedQuestIds + 1] = questId
             end
         end
@@ -664,7 +670,12 @@ function _QuestEventHandler:CleanupRemovedQuestsFallback()
             local wasTurnedIn = questLog[questId] and questLog[questId].state == QUEST_LOG_STATES.QUEST_TURNED_IN
             local wasAlreadyComplete = Questie.db.char.complete and Questie.db.char.complete[questId]
             local completeAtRemoval = QuestieDB.IsComplete(questId)
-            local shouldComplete = wasTurnedIn or wasAlreadyComplete or completeAtRemoval == 1
+            -- The server's own record, and the only one that knows anything about a quest the
+            -- database has never heard of: QuestieDB.IsComplete cannot answer for those, so an
+            -- Ascension quest the server finished by itself would otherwise be filed as abandoned.
+            local serverFlaggedComplete = IsQuestFlaggedCompleted and IsQuestFlaggedCompleted(questId)
+            local shouldComplete = wasTurnedIn or wasAlreadyComplete or completeAtRemoval == 1 or
+                serverFlaggedComplete
 
             QuestLogCache.RemoveQuest(questId)
             QuestieQuest:SetObjectivesDirty(questId)

@@ -681,8 +681,13 @@ end
 -- the tracker asks per quest and redraws often -- walking the log once per quest is quadratic.
 local questLogHeaders = {}
 
+-- Every questId the log currently holds, headers aside. The tracker draws from currentQuestlog,
+-- and this is what says whether the player still has a given quest.
+local questLogQuestIds = {}
+
 local function BuildQuestLogHeaders()
     local headers = {}
+    local questIds = {}
     local header
 
     for i = 1, (GetNumQuestLogEntries and GetNumQuestLogEntries() or 0) do
@@ -691,17 +696,21 @@ local function BuildQuestLogHeaders()
             if title and title ~= "" then
                 header = title
             end
-        elseif logId and header then
-            headers[logId] = header
+        elseif logId then
+            questIds[logId] = true
+            if header then
+                headers[logId] = header
+            end
         end
     end
 
     questLogHeaders = headers
+    questLogQuestIds = questIds
 end
 
 -- Returns the header title string, or nil if the quest is not in the log under one.
 local function GetQuestLogZoneName(questId)
-    if not questLogHeaders[questId] then
+    if not questLogQuestIds[questId] then
         -- Asked about a quest the last pass did not see, so the log has moved on since.
         BuildQuestLogHeaders()
     end
@@ -837,8 +846,16 @@ function TrackerUtils:GetSortedQuestIds()
     local questDetails = {}
     local sortObj = Questie.db.profile.trackerSortObjectives
 
-    -- One walk of the quest log for the whole draw, so the per-quest zone lookups below are reads.
+    -- One walk of the quest log for the whole draw, so the per-quest lookups below are reads.
     BuildQuestLogHeaders()
+
+    -- currentQuestlog is only as good as the removal events that maintain it, and a quest the
+    -- server finishes on its own -- Ascension's auto-complete quests -- can leave the log without
+    -- any of them landing, which strands the quest in the tracker for the rest of the session. The
+    -- log is the authority on what the player still has, so anything missing from it is skipped.
+    -- Skipped rather than pruned: a redraw that catches the log mid-refresh would otherwise throw
+    -- away state Questie is about to want back.
+    local questLogIsReadable = next(questLogQuestIds) ~= nil
     -- Update quest objectives
 
     for questId, quest in pairs(QuestiePlayer.currentQuestlog) do
@@ -911,7 +928,14 @@ function TrackerUtils:GetSortedQuestIds()
             end
         end
 
-        if type(quest) == "table" and quest.IsComplete and quest.Objectives then
+        local isInQuestLog = (not questLogIsReadable) or (questLogQuestIds[qid] == true)
+        if not isInQuestLog then
+            -- Left over from a removal nothing told the tracker about, so the object built for it
+            -- goes too -- otherwise it would still be here to serve the next draw.
+            TrackerUtils._fallbackQuests[qid] = nil
+        end
+
+        if isInQuestLog and type(quest) == "table" and quest.IsComplete and quest.Objectives then
             -- Insert Quest Ids into sortedQuestIds table
             tinsert(sortedQuestIds, qid)
 
