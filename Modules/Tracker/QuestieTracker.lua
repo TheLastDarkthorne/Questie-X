@@ -63,6 +63,22 @@ local function GetWrappedWidth(label)
     return label:GetWidth()
 end
 
+-- A quest built from partial data can reach the tracker with no name, or with the id standing in
+-- for one, and it is cached that way for the session. Ask the quest log before printing a number.
+local function GetDisplayableQuestName(quest)
+    local questName = quest.name
+
+    if (not questName) or questName == "" or questName == tostring(quest.Id) then
+        questName = TrackerUtils:GetQuestLogTitleById(quest.Id) or questName
+    end
+
+    if (not questName) or questName == "" then
+        questName = tostring(quest.Id)
+    end
+
+    return questName
+end
+
 local LSM30 = LibStub and LibStub("LibSharedMedia-3.0", true)
 
 -- Local Vars
@@ -1023,7 +1039,7 @@ function QuestieTracker:Update()
 
                         if quest.isFallback or quest._isLogFallback then
                             -- Quest not in DB: use the name stored on the fallback object
-                            local questName = quest.name or tostring(quest.Id)
+                            local questName = GetDisplayableQuestName(quest)
                             if Questie.db.profile.trackerShowQuestLevel and quest.level and quest.level > 0 then
                                 questName = "[" .. quest.level .. "] " .. questName
                             end
@@ -1057,7 +1073,7 @@ function QuestieTracker:Update()
                             -- which queries the static DB only: for a quest with no DB entry it
                             -- silently defaults to level 1, and custom server level scaling then
                             -- scales that wrong base instead of the quest's real level.
-                            local fallbackName = quest.name or tostring(quest.Id)
+                            local fallbackName = GetDisplayableQuestName(quest)
                             if Questie.db.profile.trackerShowQuestLevel and quest.level and quest.level > 0 then
                                 fallbackName = QuestieLib:GetQuestString(quest.Id, fallbackName, quest.level, false)
                             end

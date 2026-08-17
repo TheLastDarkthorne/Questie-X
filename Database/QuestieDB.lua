@@ -1766,16 +1766,36 @@ function QuestieDB.GetQuest(questId, ...) -- /dump QuestieDB.GetQuest(867)
             end
             return nil
         end
-        -- Build a minimal live-fallback quest from the quest log so the tracker still works
+        -- Build a minimal live-fallback quest from the quest log so the tracker still works.
+        -- The override that got us here is partial by nature -- a Learner record of a single
+        -- field, a correction -- but whatever it does carry beats guessing, and the quest object
+        -- built here is cached for the session, so anything left blank stays blank.
         local logEntry = QuestLogCache.GetQuest(questId)
         if not logEntry then return nil end
+        local function NonEmpty(text)
+            if text and text ~= "" then return text end
+            return nil
+        end
+        local overrideName = NonEmpty(overrideData[QuestieDB.questKeys.name])
+        local overrideLevel = overrideData[QuestieDB.questKeys.questLevel]
+        local overrideZone = overrideData[QuestieDB.questKeys.zoneOrSort]
+        local cachedTitle = NonEmpty(logEntry.title)
+        local liveTitle
+        if (not overrideName) and (not cachedTitle) and GetQuestLogIndexByID and GetQuestLogTitle then
+            -- QuestLogCache is a snapshot and can be missing the title of a quest the client
+            -- has since filled in, which is what leaves a quest showing as its own id.
+            local questLogIndex = GetQuestLogIndexByID(questId)
+            if questLogIndex and questLogIndex > 0 then
+                liveTitle = NonEmpty(GetQuestLogTitle(questLogIndex))
+            end
+        end
         local fallback = {
             Id             = questId,
-            name           = logEntry.title or tostring(questId),
-            level          = logEntry.level or 0,
-            questLevel     = logEntry.level or 0,
+            name           = overrideName or cachedTitle or liveTitle or tostring(questId),
+            level          = overrideLevel or logEntry.level or 0,
+            questLevel     = overrideLevel or logEntry.level or 0,
             requiredLevel  = 0,
-            zoneOrSort     = 0,
+            zoneOrSort     = overrideZone or 0,
             questFlags     = 0,
             specialFlags   = 0,
             Starts         = { CreatureStarts = {}, ObjectStarts = {}, ItemStarts = {} },
@@ -1896,6 +1916,24 @@ function QuestieDB.GetQuest(questId, ...) -- /dump QuestieDB.GetQuest(867)
         end
         if learnerRecord.objIndex and not QO.objIndex then QO.objIndex = learnerRecord.objIndex end
     end
+
+    -- A record that never captured a name -- a Learner entry written from an objective update, an
+    -- override carrying a single key -- leaves QO.name nil, and this object is cached for the rest
+    -- of the session, so everything downstream ends up printing the quest id. Ask the client.
+    if ((not QO.name) or QO.name == "") and GetQuestLogIndexByID and GetQuestLogTitle then
+        local questLogIndex = GetQuestLogIndexByID(questId)
+        if questLogIndex and questLogIndex > 0 then
+            local logTitle = GetQuestLogTitle(questLogIndex)
+            if logTitle and logTitle ~= "" then
+                QO.name = logTitle
+            end
+        end
+    end
+
+    -- Same story for the zone: partial records leave it nil, and callers all treat it as a number
+    -- (`quest.zoneOrSort > 0` errors outright on nil). 0 is the value everything already reads as
+    -- "no zone on file", which sends the tracker to the quest log for one.
+    QO.zoneOrSort = QO.zoneOrSort or 0
 
     local questLevel, requiredLevel = QuestieLib.GetTbcLevel(questId)
     QO.level = questLevel

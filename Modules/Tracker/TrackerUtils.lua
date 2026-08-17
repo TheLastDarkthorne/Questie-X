@@ -809,7 +809,13 @@ local function _GetZoneName(zoneOrSort, questId, zoneNameOverride)
     if zoneNameOverride and zoneNameOverride ~= "" then
         return zoneNameOverride
     end
-    if not zoneOrSort then return "Unknown Zone" end
+
+    -- A quest assembled from a partial record -- a Learner entry that never captured the field,
+    -- an override carrying a single key -- reaches here with no zoneOrSort at all. That is the
+    -- same "nothing to look up" case as 0, and the quest log below still knows where the client
+    -- files the quest, so it must not short-circuit to Unknown Zone ahead of that.
+    zoneOrSort = zoneOrSort or 0
+
     local zoneName
     local sortObj = Questie.db.profile.trackerSortObjectives
     if sortObj == "byZone" or sortObj == "byZonePlayerProximity" or sortObj == "byZonePlayerProximityReversed" then
@@ -863,6 +869,22 @@ local function _GetZoneName(zoneOrSort, questId, zoneNameOverride)
         end
     end
     return zoneName
+end
+
+-- The client's own title for a quest, or nil if the player does not have it. Quest objects can
+-- reach the tracker without a usable name -- a questDataOverrides entry that carries no name
+-- field, a QuestLogCache row read before the client had filled the title in -- and since those
+-- objects are cached for the session, the name never repairs itself. The log always knows.
+function TrackerUtils:GetQuestLogTitleById(questId)
+    local questLogIndex = GetQuestLogIndexForQuest(questId)
+    if not questLogIndex then return nil end
+
+    local title = GetQuestLogTitle(questLogIndex)
+    if title and title ~= "" then
+        return title
+    end
+
+    return nil
 end
 
 -- IsComplete must be a method (called as quest:IsComplete()), and it reads the state the last
