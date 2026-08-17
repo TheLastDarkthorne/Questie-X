@@ -685,9 +685,14 @@ local questLogHeaders = {}
 -- and this is what says whether the player still has a given quest.
 local questLogQuestIds = {}
 
+-- questId -> its row in the quest log, so re-reading a quest's leaderboard costs a lookup
+-- instead of another walk. Verified before use, since the log renumbers on every change.
+local questLogIndexes = {}
+
 local function BuildQuestLogHeaders()
     local headers = {}
     local questIds = {}
+    local indexes = {}
     local header
 
     for i = 1, (GetNumQuestLogEntries and GetNumQuestLogEntries() or 0) do
@@ -698,6 +703,7 @@ local function BuildQuestLogHeaders()
             end
         elseif logId then
             questIds[logId] = true
+            indexes[logId] = i
             if header then
                 headers[logId] = header
             end
@@ -706,6 +712,87 @@ local function BuildQuestLogHeaders()
 
     questLogHeaders = headers
     questLogQuestIds = questIds
+    questLogIndexes = indexes
+end
+
+-- Returns the quest's current row in the quest log, or nil if the player no longer has it.
+local function GetQuestLogIndexForQuest(questId)
+    local index = questLogIndexes[questId]
+    if index then
+        local _, _, _, isHeader, _, _, _, logId = GetQuestLogTitle(index)
+        if (not isHeader) and logId == questId then
+            return index
+        end
+    end
+
+    for i = 1, (GetNumQuestLogEntries and GetNumQuestLogEntries() or 0) do
+        local _, _, _, isHeader, _, _, _, logId = GetQuestLogTitle(i)
+        if (not isHeader) and logId == questId then
+            questLogIndexes[questId] = i
+            return i
+        end
+    end
+
+    return nil
+end
+
+-- 3.3.5 hands over a leaderboard line as one string -- "Icefang slain: 3/8" -- while the tracker
+-- prints the description and the counts separately, so they have to come back apart here.
+-- Objectives with nothing to count arrive as bare text and stand in as a single 0/1 step.
+local function ParseLeaderBoardText(text, finished)
+    -- Greedy on purpose: a description of its own may hold a colon, and the counter is the last one.
+    local description, collected, needed = string.match(text, "^(.*):%s*(%d+)%s*/%s*(%d+)%s*$")
+    if not description then
+        -- Servers writing their own objective strings do not always keep the colon.
+        description, collected, needed = string.match(text, "^(.-)%s*(%d+)%s*/%s*(%d+)%s*$")
+    end
+
+    if (not description) or description == "" then
+        return text, (finished and 1 or 0), 1
+    end
+
+    collected = tonumber(collected) or 0
+    needed = tonumber(needed) or 1
+    if needed <= 0 then
+        needed = 1
+    end
+
+    return description, collected, needed
+end
+
+-- Fills `objectives` from the quest's leaderboard, in place: the tracker hands these very tables
+-- to the lines it draws, so a redraw has to update them rather than swap in new ones.
+local function ReadFallbackObjectives(questLogIndex, questId, objectives)
+    local numObjectives = (GetNumQuestLeaderBoards and GetNumQuestLeaderBoards(questLogIndex)) or 0
+
+    for j = 1, numObjectives do
+        local text, objectiveType, finished = GetQuestLogLeaderBoard(j, questLogIndex)
+        if text then
+            local description, collected, needed = ParseLeaderBoardText(text, finished)
+            local objective = objectives[j]
+            if not objective then
+                objective = {}
+                objectives[j] = objective
+            end
+
+            objective.questId = questId
+            objective.Index = j
+            objective.Description = description
+            objective.text = text
+            objective.Collected = collected
+            objective.Needed = needed
+            objective.Completed = (finished or collected >= needed) and true or false
+            objective.baseType = objectiveType
+            -- Nothing here came from the DB, so map/tooltip code has to leave it alone.
+            objective.Type = "fallback"
+        end
+    end
+
+    for j = #objectives, numObjectives + 1, -1 do
+        objectives[j] = nil
+    end
+
+    return objectives
 end
 
 -- Returns the header title string, or nil if the quest is not in the log under one.
@@ -778,67 +865,86 @@ local function _GetZoneName(zoneOrSort, questId, zoneNameOverride)
     return zoneName
 end
 
+-- IsComplete must be a method (called as quest:IsComplete()), and it reads the state the last
+-- refresh stored rather than closing over the state at build time -- these quests outlive many
+-- redraws, and a captured value would still claim the quest is unfinished after it is turned in.
+local function FallbackQuestIsComplete(self)
+    if self.logIsComplete == 1 or self.logIsComplete == true then
+        return 1
+    end
+
+    if QuestiePlayer.currentQuestlog[self.Id] and IsQuestFlaggedCompleted and IsQuestFlaggedCompleted(self.Id) then
+        return 1
+    end
+
+    return 0
+end
+
+-- Re-reads everything the quest log owns: title, level, completion and the objectives. The
+-- tracker keeps fallback quests between draws, so without this they stay frozen at whatever
+-- the log said when the quest was first seen.
+---@return boolean @false if the player no longer has the quest
+function TrackerUtils:RefreshFallbackQuest(quest)
+    if not quest then return false end
+
+    local questLogIndex = GetQuestLogIndexForQuest(quest.Id)
+    if not questLogIndex then return false end
+
+    local title, level, _, _, _, isComplete = GetQuestLogTitle(questLogIndex)
+    if title and title ~= "" then
+        quest.name = title
+    end
+    if level and level > 0 then
+        quest.level = level
+    end
+
+    quest.logIsComplete = isComplete
+    quest.isComplete = (isComplete == 1)
+
+    ReadFallbackObjectives(questLogIndex, quest.Id, quest.Objectives)
+
+    return true
+end
+
 -- Returns nil if the quest is not currently in the quest log.
 function TrackerUtils:BuildFallbackQuest(questId)
-    for i = 1, GetNumQuestLogEntries() do
-        local title, level, _, isHeader, _, isComplete, _, logQuestId = GetQuestLogTitle(i)
-        if not isHeader and logQuestId == questId then
-            -- Parse objectives from the leaderboard
-            local objectives = {}
-            local numObj = GetNumQuestLeaderBoards and GetNumQuestLeaderBoards(i) or 0
-            for j = 1, numObj do
-                local text, _, finished = GetQuestLogLeaderBoard(j, i)
-                if text then
-                    -- Parse "Description: X/Y" or just "Description"
-                    local collected, needed = string.match(text, ":.-(%d+)/(%d+)%s*$")
-                    collected = tonumber(collected) or (finished and 1 or 0)
-                    needed    = tonumber(needed)    or 1
-                    objectives[j] = {
-                        text      = text,
-                        Needed    = needed,
-                        Collected = collected,
-                        Finished  = finished or (collected >= needed),
-                        Type      = "fallback",
-                    }
-                end
-            end
+    local questLogIndex = GetQuestLogIndexForQuest(questId)
+    if not questLogIndex then return nil end
 
-            -- Walk backwards from i in the quest log to find the zone header.
-            -- This is the canonical 3.3.5 method: zone headers sit above their quests.
-            local zoneText = nil
-            for h = i, 1, -1 do
-                local hTitle, _, _, hIsHeader = GetQuestLogTitle(h)
-                if hIsHeader and hTitle and hTitle ~= "" then
-                    zoneText = hTitle
-                    break
-                end
-            end
-            local zoneId = (zoneText and GetAreaIdByZoneName(zoneText)) or 0
-            local zoneNameOverride = nil
-            if zoneText and (not zoneId or zoneId == 0) then
-                zoneNameOverride = zoneText
-            end
-
-            local quest = {
-                Id               = questId,
-                name             = title or ("Quest " .. questId),
-                level            = level or 0,
-                zoneOrSort       = zoneId,
-                zoneName         = zoneText,
-                zoneNameOverride = zoneNameOverride,
-                Objectives       = objectives,
-                SpecialObjectives = {},
-                isFallback       = true,
-            }
-            -- IsComplete must be a method (called as quest:IsComplete())
-            quest.IsComplete = function(self)
-                return (isComplete == 1 or (QuestiePlayer.currentQuestlog[questId] and IsQuestFlaggedCompleted and IsQuestFlaggedCompleted(questId))) and 1 or 0
-            end
-
-            return quest
+    -- Walk backwards from the quest in the log to find the zone header.
+    -- This is the canonical 3.3.5 method: zone headers sit above their quests.
+    local zoneText = nil
+    for h = questLogIndex, 1, -1 do
+        local hTitle, _, _, hIsHeader = GetQuestLogTitle(h)
+        if hIsHeader and hTitle and hTitle ~= "" then
+            zoneText = hTitle
+            break
         end
     end
-    return nil
+    local zoneId = (zoneText and GetAreaIdByZoneName(zoneText)) or 0
+    local zoneNameOverride = nil
+    if zoneText and (not zoneId or zoneId == 0) then
+        zoneNameOverride = zoneText
+    end
+
+    local quest = {
+        Id                = questId,
+        name              = "Quest " .. questId,
+        level             = 0,
+        zoneOrSort        = zoneId,
+        zoneName          = zoneText,
+        zoneNameOverride  = zoneNameOverride,
+        Objectives        = {},
+        SpecialObjectives = {},
+        isFallback        = true,
+        IsComplete        = FallbackQuestIsComplete,
+    }
+
+    -- Same read the tracker does on every later draw, so a quest built here and one refreshed
+    -- from the cache carry exactly the same fields.
+    TrackerUtils:RefreshFallbackQuest(quest)
+
+    return quest
 end
 
 function TrackerUtils:GetSortedQuestIds()
@@ -921,6 +1027,11 @@ function TrackerUtils:GetSortedQuestIds()
                     if fallback then
                         TrackerUtils._fallbackQuests[qid] = fallback
                     end
+                else
+                    -- Cached by an earlier draw, so its objectives and completion state are as
+                    -- old as the cache. Nothing else updates them -- these quests have no DB
+                    -- entry, so QuestieQuest's populate path skips them entirely.
+                    TrackerUtils:RefreshFallbackQuest(fallback)
                 end
                 if fallback then
                     quest = fallback
