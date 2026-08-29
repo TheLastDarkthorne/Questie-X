@@ -358,13 +358,13 @@ function Townsfolk:BuildCharacterTownsfolk()
     local playerFaction = UnitFactionGroup("player")
     Questie.db.char.townsfolkClass = playerClass
 
-    if playerFaction and Questie.db.global.factionSpecificTownsfolk[playerFaction] then
+    if playerFaction and Questie.db.global.factionSpecificTownsfolk and Questie.db.global.factionSpecificTownsfolk[playerFaction] then
         for key, npcs in pairs(Questie.db.global.factionSpecificTownsfolk[playerFaction]) do
             Questie.db.char.townsfolk[key] = npcs
         end
     end
 
-    if Questie.db.global.classSpecificTownsfolk[playerClass] then
+    if Questie.db.global.classSpecificTownsfolk and Questie.db.global.classSpecificTownsfolk[playerClass] then
         for key, npcs in pairs(Questie.db.global.classSpecificTownsfolk[playerClass]) do
             Questie.db.char.townsfolk[key] = npcs
         end

@@ -310,12 +310,18 @@ QuestieInit.Stages[1] = function() -- run as a coroutine
         QuestieCorrections:MinimalInit()
     end
 
-    local dbCompiledCount = compiledMetadata.dbCompiledCount
+    -- Deferred (custom-server/plugin) logins haven't loaded the DB yet at this point --
+    -- Townsfolk.Initialize(), which populates factionSpecificTownsfolk/classSpecificTownsfolk,
+    -- only runs inside loadFullDatabase(). Building townsfolk here would index those nil
+    -- tables and crash. Stage3 builds it instead, right after the deferred compile completes.
+    if not compilationDeferred then
+        local dbCompiledCount = compiledMetadata.dbCompiledCount
 
-    if (not Questie.db.char.townsfolk) or (dbCompiledCount ~= Questie.db.char.townsfolkVersion) or (Questie.db.char.townsfolkClass ~= UnitClass("player")) then
-        Questie.db.char.townsfolkVersion = dbCompiledCount
-        coYield()
-        Townsfolk:BuildCharacterTownsfolk()
+        if (not Questie.db.char.townsfolk) or (dbCompiledCount ~= Questie.db.char.townsfolkVersion) or (Questie.db.char.townsfolkClass ~= UnitClass("player")) then
+            Questie.db.char.townsfolkVersion = dbCompiledCount
+            coYield()
+            Townsfolk:BuildCharacterTownsfolk()
+        end
     end
 
     coYield()
@@ -422,6 +428,19 @@ QuestieInit.Stages[3] = function() -- run as a coroutine
         end
         QuestieDBCompiler:Compile()
         QuestieDB:Initialize()
+
+        -- Deferred logins skipped the Stage1 townsfolk build (see Stage1) because the DB
+        -- wasn't loaded yet there. Build it now that loadFullDatabase()/compile has run.
+        if compilationDeferred then
+            local postCompileMetadata = GetCompiledDBMetadata()
+            local dbCompiledCount = postCompileMetadata.dbCompiledCount
+
+            if (not Questie.db.char.townsfolk) or (dbCompiledCount ~= Questie.db.char.townsfolkVersion) or (Questie.db.char.townsfolkClass ~= UnitClass("player")) then
+                Questie.db.char.townsfolkVersion = dbCompiledCount
+                coYield()
+                Townsfolk:BuildCharacterTownsfolk()
+            end
+        end
     else
         Questie:Debug(Questie.DEBUG_INFO, "[QuestieInit:Stage3] DB cache is current; skipping compilation.")
     end
