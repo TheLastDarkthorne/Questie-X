@@ -104,6 +104,21 @@ function QuestEventHandler:RegisterEvents()
         end)
     end
 
+    -- Force a full reconciliation whenever the player opens the native quest log.
+    -- QuestLogCache only updates its stored objective counts when it detects a change, so if a
+    -- scan ever ran while the game's own quest log text was still lagging behind the server, the
+    -- Tracker can get stuck showing stale progress with nothing left to trigger a retry. Looking
+    -- at the quest log is the moment the player is most likely to notice the mismatch, so treat it
+    -- as a cue to force a fresh comparison against the live quest log state.
+    local questLogFrame = QuestLogExFrame or ClassicQuestLog or QuestLogFrame
+    if questLogFrame then
+        questLogFrame:HookScript("OnShow", function()
+            Questie:Debug(Questie.DEBUG_DEVELOP, "[Quest Event] Quest log opened: forcing full quest log scan")
+            doFullQuestLogScan = true
+            _QuestEventHandler:QuestLogUpdate()
+        end)
+    end
+
     -- StaticPopup dialog hooks. Deleteing Quest items do not always trigger a Quest Log Update.
     hooksecurefunc("StaticPopup_Show", function(...)
         -- Hook StaticPopup_Show. If we find the "DELETE_ITEM" dialog, check for Quest Items and notify the player.

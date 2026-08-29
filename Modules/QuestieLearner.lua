@@ -795,6 +795,19 @@ end
 -- so the second debounce stage would only add redundant latency.
 local _deferPinRefreshScheduling = false
 
+-- Clearing QuestieDB.private.questCache[questId] makes the NEXT QuestieDB.GetQuest(questId)
+-- rebuild a brand new quest table so the just-learned override data takes effect. But
+-- QuestiePlayer.currentQuestlog[questId] (what the Tracker actually reads every redraw) holds a
+-- direct reference to the OLD table and is never told about the swap, so it freezes forever on
+-- whatever the old table last held while every future update lands on the new, unreferenced one.
+-- Rebuild immediately and re-point currentQuestlog at the new table so nothing is left orphaned.
+local function _InvalidateQuestCache(questId)
+    QuestieDB.private.questCache[questId] = nil
+    if QuestiePlayer.currentQuestlog[questId] then
+        QuestiePlayer.currentQuestlog[questId] = QuestieDB.GetQuest(questId)
+    end
+end
+
 local function _RefreshActiveQuestPins(questIdSet)
     -- Skip scheduling when the set is empty (avoids no-op timer callbacks)
     if not next(questIdSet) then return end
@@ -1995,7 +2008,7 @@ function QuestieLearner:LearnQuest(questId, data)
             end
         end
         if QuestieDB.private and QuestieDB.private.questCache then
-            QuestieDB.private.questCache[questId] = nil
+            _InvalidateQuestCache(questId)
         end
     end
 
@@ -2044,7 +2057,7 @@ function QuestieLearner:LearnQuestGiver(questId, entityId, entityType, isStart)
         end
         if not found then table.insert(ovrList, entityId) end
         if QuestieDB.private and QuestieDB.private.questCache then
-            QuestieDB.private.questCache[questId] = nil
+            _InvalidateQuestCache(questId)
         end
     end
 
@@ -2120,7 +2133,7 @@ function QuestieLearner:LearnQuestObjectiveNPC(questId, npcId, objText, objectiv
             ovr.objIndex[objectiveIndex] = existing.objIndex[objectiveIndex]
         end
         if QuestieDB.private and QuestieDB.private.questCache then
-            QuestieDB.private.questCache[questId] = nil
+            _InvalidateQuestCache(questId)
         end
     end
 
@@ -2209,7 +2222,7 @@ function QuestieLearner:LearnQuestObjectiveObject(questId, objectId, objText, ob
             ovr.objIndex[objectiveIndex] = existing.objIndex[objectiveIndex]
         end
         if QuestieDB.private and QuestieDB.private.questCache then
-            QuestieDB.private.questCache[questId] = nil
+            _InvalidateQuestCache(questId)
         end
     end
 

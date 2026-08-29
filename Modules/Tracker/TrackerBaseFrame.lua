@@ -317,16 +317,17 @@ function TrackerBaseFrame.OnDragStart(frame, button)
     if TrackerBaseFrame.isMoving ~= true and TrackerBaseFrame.isSizing ~= true then
         if IsMouseButtonDown(button) and button ~= "MiddleButton" then
             if (IsControlKeyDown() and Questie.db.profile.trackerLocked and not ChatEdit_GetActiveWindow()) or not Questie.db.profile.trackerLocked then
-                if baseFrame:IsMovable() then
-                    Questie:Debug(Questie.DEBUG_DEVELOP, "[TrackerBaseFrame:OnDragStart] - Dragging Started.")
-                    TrackerBaseFrame.isMoving = true
-                    TrackerBaseFrame.baseFrame.isMoving = true
+                -- Force movability here instead of trusting baseFrame:IsMovable(), which is
+                -- only refreshed asynchronously by TrackerBaseFrame:Update() on unrelated
+                -- tracker events and is almost never in sync with the live Ctrl/lock state
+                -- already checked above at the moment of an actual drag attempt.
+                baseFrame:SetMovable(true)
+                Questie:Debug(Questie.DEBUG_DEVELOP, "[TrackerBaseFrame:OnDragStart] - Dragging Started.")
+                TrackerBaseFrame.isMoving = true
+                TrackerBaseFrame.baseFrame.isMoving = true
 
-                    baseFrame:StartMoving()
-                    TrackerBaseFrame:Update()
-                else
-                    Questie:Debug(Questie.DEBUG_DEVELOP, "[TrackerBaseFrame:OnDragStart] - Frame is not movable!")
-                end
+                baseFrame:StartMoving()
+                TrackerBaseFrame:Update()
             end
         end
     end

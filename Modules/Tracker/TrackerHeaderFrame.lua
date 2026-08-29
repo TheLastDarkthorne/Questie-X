@@ -51,6 +51,9 @@ function TrackerHeaderFrame.Initialize(baseFrame)
 
     questieIcon:EnableMouse(true)
     questieIcon:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+    questieIcon:RegisterForDrag("LeftButton")
+    questieIcon:SetScript("OnDragStart", TrackerBaseFrame.OnDragStart)
+    questieIcon:SetScript("OnDragStop", TrackerBaseFrame.OnDragStop)
 
     questieIcon:SetScript("OnClick", function(_, button)
         if button == "LeftButton" then

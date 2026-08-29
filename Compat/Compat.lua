@@ -474,6 +474,12 @@ function QuestieCompat.GetServerTime()
 end
 
 local questObjectivesCache = {}
+-- Chat-parsed objective progress (see QuestieCompat.UiInfoMessage below) is only valid for a
+-- short window: it exists to get ahead of GetQuestLogLeaderBoard's text, which can lag behind
+-- the chat message on this server. If it isn't consumed quickly, GetQuestLogLeaderBoard has
+-- almost certainly caught up on its own, so an old entry is more likely a stale/mismatched
+-- leftover (e.g. two quests sharing the same objective text) than a still-valid override.
+local QUEST_OBJECTIVE_CACHE_TTL = 3
 
 local function parseQuestObjective(text)
     local name, fulfilled, required = string.match(string.gsub(text, "\239\188\154", ":"), "(.*):%s*([%d]+)%s*/%s*([%d]+)")
@@ -499,10 +505,14 @@ cLog.GetQuestObjectives = function(questID, questLogIndex)
                 if objectiveType ~= "log" and description then
                     local objectiveName, numFulfilled, numRequired = parseQuestObjective(description)
                     if objectiveName then
-                        local fulfilled = questObjectivesCache[objectiveName]
-                        if fulfilled then
-                            numFulfilled = fulfilled
+                        local cachedOverride = questObjectivesCache[objectiveName]
+                        if cachedOverride then
+                            -- Always drop it on read: a hit is single-use whether or not it's stale,
+                            -- otherwise a leftover entry could keep getting reapplied to unrelated reads.
                             questObjectivesCache[objectiveName] = nil
+                            if (GetTime() - cachedOverride.time) <= QUEST_OBJECTIVE_CACHE_TTL then
+                                numFulfilled = cachedOverride.value
+                            end
                         end
                     end
 
@@ -1746,7 +1756,7 @@ function QuestieCompat.UiInfoMessage(event, message)
         if string.find(message, pattern) then
             local objectiveName, numFulfilled = parseQuestObjective(message)
             if objectiveName and numFulfilled then
-                questObjectivesCache[objectiveName] = numFulfilled
+                questObjectivesCache[objectiveName] = { value = numFulfilled, time = GetTime() }
             end
             MinimapIcon:UpdateText(message)
         end
