@@ -327,9 +327,15 @@ QuestieInit.Stages[1] = function() -- run as a coroutine
     coYield()
     QuestieDB:Initialize()
 
-    coYield()
-    if QuestieLearner and QuestieLearner.Initialize then
-        QuestieLearner:Initialize()
+    -- Same reasoning as the townsfolk guard above: on a deferred login, QuestieDB's raw
+    -- data/override tables aren't populated yet (loadFullDatabase() was skipped), and
+    -- QuestieLearner:Initialize() reads/copies them (e.g. QuestieDB.npcDataOverrides).
+    -- Stage3 runs it instead, right after the deferred compile completes.
+    if not compilationDeferred then
+        coYield()
+        if QuestieLearner and QuestieLearner.Initialize then
+            QuestieLearner:Initialize()
+        end
     end
 
     coYield()
@@ -439,6 +445,13 @@ QuestieInit.Stages[3] = function() -- run as a coroutine
                 Questie.db.char.townsfolkVersion = dbCompiledCount
                 coYield()
                 Townsfolk:BuildCharacterTownsfolk()
+            end
+
+            -- Stage1 also skipped QuestieLearner:Initialize() for the same reason (see
+            -- Stage1). Run it now that loadFullDatabase()/compile has populated the DB.
+            coYield()
+            if QuestieLearner and QuestieLearner.Initialize then
+                QuestieLearner:Initialize()
             end
         end
     else
