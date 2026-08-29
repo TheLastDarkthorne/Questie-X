@@ -287,7 +287,7 @@ QuestieInit.Stages[1] = function() -- run as a coroutine
     needsCompilation = (not dbIsCompiled) or (QuestieLib:GetAddonVersionString() ~= dbCompiledOnVersion) or (l10n:GetUILocale() ~= dbCompiledLang) or (compiledRootMetadata.dbCompiledExpansion ~= WOW_PROJECT_ID)
 
     -- Custom servers or presence of DB plugins: always defer to Stage3 to wait for plugin data injection
-    if Questie.IsAscension or Questie.IsEbonhold or Questie.IsValanior or QuestieServer:IsAnyDBPluginEnabled() then
+    if Questie.IsAscension or Questie.IsEbonhold or Questie.IsValanior or Questie.IsTriumvirate or QuestieServer:IsAnyDBPluginEnabled() then
         compilationDeferred = true
         l10n:Initialize()
         coYield()
@@ -405,7 +405,7 @@ QuestieInit.Stages[3] = function() -- run as a coroutine
     -- Recompile custom-server/plugin data only when the compiled cache no longer
     -- matches the loaded plugin set. Learner data is applied as live overrides and
     -- does not require rebuilding the binary DB cache on every login.
-    local isCustomServer = Questie.IsAscension or Questie.IsEbonhold or Questie.IsValanior or QuestieServer:IsAnyDBPluginEnabled()
+    local isCustomServer = Questie.IsAscension or Questie.IsEbonhold or Questie.IsValanior or Questie.IsTriumvirate or QuestieServer:IsAnyDBPluginEnabled()
     local pluginSignature = QuestiePluginAPI:GetLoadedSignature()
     local stage3CompiledMetadata, stage3CompiledRootMetadata = GetCompiledDBMetadata()
     local cacheMatchesPlugins = stage3CompiledRootMetadata.dbCompiledPluginSignature == pluginSignature

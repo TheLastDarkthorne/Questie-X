@@ -21,6 +21,7 @@ Questie.IsClassicEra = (WOW_PROJECT_ID == WOW_PROJECT_CLASSIC)
 Questie.IsEbonhold  = false
 Questie.IsAscension = false
 Questie.IsValanior  = false
+Questie.IsTriumvirate = false
 
 if _G.IsAscensionServer or lRealmName:find("ascension") or lRealmName:find("area 52") or
    lRealmName:find("al'ar") or lRealmName:find("thrall") or lRealmName:find("bronzebeard") or lRealmName:find("warcraft reborn") then
@@ -29,17 +30,20 @@ elseif lRealmName:find("ebonhold") then
     Questie.IsEbonhold = true
 elseif lRealmName:find("valanior") then
     Questie.IsValanior = true
+elseif lRealmName:find("triumvirate") then
+    Questie.IsTriumvirate = true
 end
 
 -- Derive expected DB plugin name for this client
 local function GetExpectedPluginFlavor()
-    if Questie.IsAscension  then return "AscensionDB",  "Questie-X-AscensionDB"  end
-    if Questie.IsEbonhold   then return "EbonholdDB",   "Questie-X-EbonholdDB"   end
-    if Questie.IsValanior   then return "ValaniorDB",   "Questie-X-ValaniorDB"   end
-    if Questie.IsWotlk      then return "WotLKDB",      "Questie-X-WotLKDB"      end
-    if Questie.IsTBC        then return "TBCDB",        "Questie-X-TBCDB"        end
-    if Questie.IsClassicEra then return "ClassicDB",    "Questie-X-ClassicDB"    end
-    if Questie.IsRetail     then return "RetailDB",     "Questie-X-RetailDB"     end
+    if Questie.IsAscension   then return "AscensionDB",   "Questie-X-AscensionDB"   end
+    if Questie.IsEbonhold    then return "EbonholdDB",    "Questie-X-EbonholdDB"    end
+    if Questie.IsValanior    then return "ValaniorDB",    "Questie-X-ValaniorDB"    end
+    if Questie.IsTriumvirate then return "TriumvirateDB", "Questie-X-TriumvirateDB" end
+    if Questie.IsWotlk       then return "WotLKDB",       "Questie-X-WotLKDB"       end
+    if Questie.IsTBC         then return "TBCDB",         "Questie-X-TBCDB"         end
+    if Questie.IsClassicEra  then return "ClassicDB",     "Questie-X-ClassicDB"     end
+    if Questie.IsRetail      then return "RetailDB",      "Questie-X-RetailDB"      end
     return nil, nil
 end
 
@@ -61,7 +65,8 @@ function QuestieServer:IsAnyDBPluginEnabled()
         "Questie-X-AscensionDB",
         "Questie-X-EbonholdDB",
         "Questie-X-ValaniorDB",
-        "Questie-X-RetailDB"
+        "Questie-X-RetailDB",
+        "Questie-X-TriumvirateDB"
     }
     
     for _, addonName in ipairs(dbPlugins) do

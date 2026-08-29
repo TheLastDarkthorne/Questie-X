@@ -12,7 +12,7 @@
 ## Notes-ptBR: Ajudante de missão
 ## Notes-frFR: Assistant de quête
 ## Version: 1.6.4
-## OptionalDeps: Ace3, CallbackHandler-1.0, HereBeDragons, LibDataBroker-1.1, LibDBIcon-1.0, LibSharedMedia-3.0, LibStub, LibUIDropDownMenu, Questie-X-WotLKDB, Questie-X-ClassicDB, Questie-X-TBCDB, Questie-X-AscensionDB, Questie-X-EbonholdDB
+## OptionalDeps: Ace3, CallbackHandler-1.0, HereBeDragons, LibDataBroker-1.1, LibDBIcon-1.0, LibSharedMedia-3.0, LibStub, LibUIDropDownMenu, Questie-X-WotLKDB, Questie-X-ClassicDB, Questie-X-TBCDB, Questie-X-AscensionDB, Questie-X-EbonholdDB, Questie-X-TriumvirateDB
 ## SavedVariables: QuestieConfig, QuestieLearnerDB, QuestieCacheDB, QuestieJourneyDB
 ## SavedVariablesPerCharacter: QuestieConfigCharacter
 ## X-Curse-Project-ID: 334372
