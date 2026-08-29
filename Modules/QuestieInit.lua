@@ -434,28 +434,30 @@ QuestieInit.Stages[3] = function() -- run as a coroutine
         end
         QuestieDBCompiler:Compile()
         QuestieDB:Initialize()
-
-        -- Deferred logins skipped the Stage1 townsfolk build (see Stage1) because the DB
-        -- wasn't loaded yet there. Build it now that loadFullDatabase()/compile has run.
-        if compilationDeferred then
-            local postCompileMetadata = GetCompiledDBMetadata()
-            local dbCompiledCount = postCompileMetadata.dbCompiledCount
-
-            if (not Questie.db.char.townsfolk) or (dbCompiledCount ~= Questie.db.char.townsfolkVersion) or (Questie.db.char.townsfolkClass ~= UnitClass("player")) then
-                Questie.db.char.townsfolkVersion = dbCompiledCount
-                coYield()
-                Townsfolk:BuildCharacterTownsfolk()
-            end
-
-            -- Stage1 also skipped QuestieLearner:Initialize() for the same reason (see
-            -- Stage1). Run it now that loadFullDatabase()/compile has populated the DB.
-            coYield()
-            if QuestieLearner and QuestieLearner.Initialize then
-                QuestieLearner:Initialize()
-            end
-        end
     else
         Questie:Debug(Questie.DEBUG_INFO, "[QuestieInit:Stage3] DB cache is current; skipping compilation.")
+    end
+
+    -- Deferred logins skipped the Stage1 townsfolk build and QuestieLearner init (see Stage1)
+    -- because the DB wasn't loaded/plugins hadn't finished injecting yet there. Run them now
+    -- regardless of whether a recompile happened above (a valid cached DB doesn't need to be
+    -- recompiled, but this catch-up work still needs to run once per session).
+    if compilationDeferred then
+        local postCompileMetadata = GetCompiledDBMetadata()
+        local dbCompiledCount = postCompileMetadata.dbCompiledCount
+
+        if (not Questie.db.char.townsfolk) or (dbCompiledCount ~= Questie.db.char.townsfolkVersion) or (Questie.db.char.townsfolkClass ~= UnitClass("player")) then
+            Questie.db.char.townsfolkVersion = dbCompiledCount
+            coYield()
+            Townsfolk:BuildCharacterTownsfolk()
+        end
+
+        -- Stage1 also skipped QuestieLearner:Initialize() for the same reason (see
+        -- Stage1). Run it now that loadFullDatabase()/compile has populated the DB.
+        coYield()
+        if QuestieLearner and QuestieLearner.Initialize then
+            QuestieLearner:Initialize()
+        end
     end
 
     -- register events that rely on questie being initialized

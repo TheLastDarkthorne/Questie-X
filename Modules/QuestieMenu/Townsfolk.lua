@@ -400,6 +400,12 @@ local function _UpdateFoodDrink()
 end
 
 function Townsfolk:UpdatePlayerVendors() -- call on levelup
+    if not Questie.db.char.vendorList then
+        -- Can be reached (via QuestieMenu:OnLogin -> here) from SmoothReset mid-session,
+        -- not just the login init coroutine, so BuildCharacterTownsfolk isn't guaranteed
+        -- to have run yet.
+        Questie.db.char.vendorList = {}
+    end
     local _, playerClass = UnitClass("player")
     _UpdateFoodDrink()
     if playerClass == "HUNTER" then

@@ -118,7 +118,7 @@ local function IsBaseDatabaseMissing()
         and QuestieDB:IsBaseDatabaseMissing()
 end
 
-local function GetDataSourceMode()
+GetDataSourceMode = function()
     if IsBaseDatabaseMissing() then
         return "learner"
     end
@@ -336,7 +336,7 @@ local function CopyWithoutField(data, skippedKey)
     return copy
 end
 
-local function DeepCopy(value)
+DeepCopy = function(value)
     if type(value) ~= "table" then return value end
 
     local copy = {}
@@ -2009,6 +2009,7 @@ function QuestieLearner:LearnQuest(questId, data)
         end
         if QuestieDB.private and QuestieDB.private.questCache then
             _InvalidateQuestCache(questId)
+            _RefreshActiveQuestPins({ [questId] = true })
         end
     end
 
@@ -2058,6 +2059,7 @@ function QuestieLearner:LearnQuestGiver(questId, entityId, entityType, isStart)
         if not found then table.insert(ovrList, entityId) end
         if QuestieDB.private and QuestieDB.private.questCache then
             _InvalidateQuestCache(questId)
+            _RefreshActiveQuestPins({ [questId] = true })
         end
     end
 
