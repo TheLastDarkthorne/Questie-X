@@ -2278,6 +2278,41 @@ function QuestieTracker:UpdateHeight()
     end
 end
 
+-- The quest watch hooks below are handed a quest log index by the default quest log, but an
+-- objective update in TBC -- and some 3.3.5 servers -- pass the questId straight through, so
+-- both have to be accepted. All three hooks resolve it here so they can never disagree about
+-- what a given argument meant.
+--
+-- GetQuestLogIndexByID returns nil, not 0, when the player does not have the quest, so its
+-- result has to be checked before it is compared: the previous `GetQuestLogIndexByID(index) > 0`
+-- threw "attempt to compare nil with number" from inside a secure post-hook, which took the
+-- quest log's own click handler down with it.
+---@return number? questId, boolean? isHeader
+local function _ResolveWatchedQuestId(index)
+    if (not index) or index <= 0 then
+        return nil
+    end
+
+    local _, _, _, isHeader, _, _, _, questId = GetQuestLogTitle(index)
+
+    if isHeader then
+        return nil, true
+    end
+
+    if questId and questId > 0 then
+        return questId
+    end
+
+    -- The row carries no id, so "index" may already be one. It only counts if the player
+    -- actually has that quest.
+    local questLogIndex = GetQuestLogIndexByID and GetQuestLogIndexByID(index)
+    if questLogIndex and questLogIndex > 0 then
+        return index
+    end
+
+    return nil
+end
+
 function QuestieTracker:Unhook()
     if (not QuestieTracker.alreadyHooked) then
         return
@@ -2347,17 +2382,18 @@ function QuestieTracker:HookBaseTracker()
 
     -- Intercept and return a Questie boolean value
     IsQuestWatched = function(index)
-        local _, _, _, _, _, _, _, questId = GetQuestLogTitle(index)
-        if questId == 0 then
-            -- When an objective progresses in TBC "index" is the questId, but when a quest is manually added to the quest watch
-            -- (e.g. shift clicking it in the quest log) "index" is the questLogIndex.
-            questId = index
+        local questId = _ResolveWatchedQuestId(index)
+        if not questId then
+            return false
         end
 
+        -- A real boolean. The quest log reads this to decide which way its Track button
+        -- toggles and whether to show the check texture on a quest title, and handing it a
+        -- quest table worked only by accident.
         if not Questie.db.profile.autoTrackQuests then
-            return questId and Questie.db.char.TrackedQuests[questId]
+            return Questie.db.char.TrackedQuests[questId] ~= nil
         else
-            return questId and QuestiePlayer.currentQuestlog[questId] and (not Questie.db.char.AutoUntrackedQuests[questId])
+            return (QuestiePlayer.currentQuestlog[questId] ~= nil) and (not Questie.db.char.AutoUntrackedQuests[questId])
         end
     end
 
@@ -2456,19 +2492,10 @@ function QuestieTracker.RemoveQuestWatch(index, isQuestie)
 
     if not isQuestie then
         if index then
-            local _, _, _, isHeader, _, _, _, questId = GetQuestLogTitle(index)
+            local questId, isHeader = _ResolveWatchedQuestId(index)
 
-            if isHeader then
+            if isHeader or (not questId) then
                 return
-            end
-
-            if (not questId) or questId == 0 then
-                -- Maybe index was already a questId (Ascension/Ebonhold extension)
-                if index > 0 and (GetQuestLogIndexByID and GetQuestLogIndexByID(index) > 0) then
-                    questId = index
-                else
-                    return
-                end
             end
 
             if questId and questId > 0 then
@@ -2538,18 +2565,8 @@ function QuestieTracker:AQW_Insert(index, expire)
     -- that is all the player will see. This also prevents hitting the Blizzard Quest Watch Limit.
     RemoveQuestWatch(index, true)
 
-    local _, _, _, isHeader, _, _, _, questId = GetQuestLogTitle(index)
-    if isHeader then return end
-
-    if (not questId) or questId == 0 then
-        -- When an objective progresses in TBC "index" is the questId, but when a quest is manually added to the quest watch
-        -- (e.g. shift clicking it in the quest log) "index" is the questLogIndex.
-        if index and index > 50 and GetQuestLogIndexByID and GetQuestLogIndexByID(index) > 0 then
-            questId = index
-        else
-            return
-        end
-    end
+    local questId, isHeader = _ResolveWatchedQuestId(index)
+    if isHeader or (not questId) then return end
 
     if questId and questId > 0 then
         -- Check if this was a manual user action (Shift-Click in Quest Log or similar)
@@ -2616,6 +2633,13 @@ function QuestieTracker:AQW_Insert(index, expire)
                 local fallback = TrackerUtils:BuildFallbackQuest(questId)
                 if fallback then
                     TrackerUtils._fallbackQuests[questId] = fallback
+                    -- The draw walks currentQuestlog, so a fallback that is only in
+                    -- _fallbackQuests is never reached and the Track button looks dead for
+                    -- every quest the database doesn't know. Register the id the same way the
+                    -- login rebuild does (GetAllQuestIds) and the draw picks the object up.
+                    if not QuestiePlayer.currentQuestlog[questId] then
+                        QuestiePlayer.currentQuestlog[questId] = questId
+                    end
                     QuestieCombatQueue:Queue(function()
                         QuestieTracker:Update()
                     end)

@@ -234,24 +234,44 @@ function QuestEventHandler:RegisterEvents()
     _QuestEventHandler:InitQuestLog()
 end
 
+-- 5 seconds of half-second passes. A quest the client has still not handed over by then is
+-- not going to arrive, and giving up lets the rebuild below run with what did arrive.
+local INIT_QUEST_LOG_MAX_ATTEMPTS = 10
+
 --- On Login mark all quests in the quest log with QUEST_ACCEPTED state
-function _QuestEventHandler:InitQuestLog()
+---@param attempt number? @1 on the first pass, incremented by each retry
+function _QuestEventHandler:InitQuestLog(attempt)
+    attempt = attempt or 1
+
     -- Fill the QuestLogCache for first time
     local cacheMiss, changes = QuestLogCache.CheckForChanges(nil)
-    
-    if cacheMiss and (not Questie.started) then
-        Questie:Debug(Questie.DEBUG_INFO, "[QuestEventHandler:InitQuestLog] Cache miss during init, retrying in 0.5s...")
-        C_Timer.After(0.5, function()
-            _QuestEventHandler:InitQuestLog()
-        end)
-        return
-    end
 
+    -- Whatever was read is valid even when the rest of the log was not ready, so it is marked
+    -- before any retry. The previous version returned here and threw these away.
     for questId, _ in pairs(changes) do
         questLog[questId] = {
             state = QUEST_LOG_STATES.QUEST_ACCEPTED
         }
         QuestieLib:CacheItemNames(questId)
+    end
+
+    if cacheMiss and attempt < INIT_QUEST_LOG_MAX_ATTEMPTS then
+        Questie:Debug(Questie.DEBUG_INFO, "[QuestEventHandler:InitQuestLog] Cache miss during init, retrying in 0.5s... attempt:", attempt)
+        C_Timer.After(0.5, function()
+            _QuestEventHandler:InitQuestLog(attempt + 1)
+        end)
+        return
+    end
+
+    if attempt > 1 then
+        -- The login sequence reads this cache exactly once, in QuestieQuest:GetAllQuestIds, and
+        -- it can get there before the client has handed over every quest. Quests recovered by a
+        -- retry are then in the cache but missing from currentQuestlog -- which is what the
+        -- tracker draws from and what IsQuestWatched answers with -- so they stayed invisible,
+        -- and their Track button did nothing, until a /reload found the client cache warm.
+        -- Rebuilding from the now-complete cache is what that /reload was doing.
+        Questie:Debug(Questie.DEBUG_INFO, "[QuestEventHandler:InitQuestLog] Quest log cache filled on attempt", attempt, "- rebuilding the quest log")
+        QuestieQuest:GetAllQuestIds()
     end
 end
 

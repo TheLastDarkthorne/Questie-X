@@ -973,15 +973,6 @@ end
 -- module-level functions that read shared upvalue state set each cycle.
 -- ---------------------------------------------------------------------------
 
-local function _HasMissingCompletedFlag(list)
-    if not list then return false end
-    for _, obj in pairs(list) do
-        if obj and obj.Completed == nil then
-            return true
-        end
-    end
-    return false
-end
 
 local function _GetCompleteIconType(quest)
     local iconType = Questie.ICON_TYPE_COMPLETE
@@ -1186,22 +1177,25 @@ function QuestieArrow:UpdateNearestTargets()
 
         local debugCollect = Questie and Questie.db and Questie.db.profile and Questie.db.profile.debugArrow
 
-        -- Avoid spamming QuestieQuest:PopulateQuestLogInfo (it can trigger marker rebuilds and flicker).
-        -- Only populate when objective completion flags are missing, and throttle per quest id.
+        -- The arrow is a passive consumer of quest data. PopulateQuestLogInfo runs
+        -- objective:Update() on every objective, which rebuilds spawns/markers and
+        -- causes a visible per-second frame hitch. Normal quest events (accept,
+        -- QUEST_LOG_UPDATE -> tracker) already populate objectives, so only seed a
+        -- quest whose objectives are entirely absent. Never re-populate just because
+        -- a Completed flag is nil -- some objective types leave it nil for good, which
+        -- otherwise triggers the rebuild on every scan regardless of the throttles.
         if QuestieQuest and QuestieQuest.PopulateQuestLogInfo and quest.Id then
-            local needsPopulate = false
-            if not quest.Objectives and not quest.SpecialObjectives then
-                needsPopulate = true
-            elseif _HasMissingCompletedFlag(quest.Objectives) or _HasMissingCompletedFlag(quest.SpecialObjectives) then
-                needsPopulate = true
-            end
-            if needsPopulate then
-                local now = GetTime()
-                local last = lastPopulateByQuestId[quest.Id] or 0
-                if (last + 2.0) < now then
-                    lastPopulateByQuestId[quest.Id] = now
-                    QuestieQuest:PopulateQuestLogInfo(quest)
-                end
+            local hasObjectives = quest.Objectives and next(quest.Objectives) ~= nil
+            local hasSpecial = quest.SpecialObjectives and next(quest.SpecialObjectives) ~= nil
+            -- Nudge a quest whose objectives haven't been populated yet, but only ONCE
+            -- per quest id. Quest objects are created with empty Objectives/SpecialObjectives
+            -- tables (Database/QuestieDB.lua), and objective-less turn-in / breadcrumb quests
+            -- stay empty for good, so keying off emptiness alone would rebuild them on every
+            -- scan and reintroduce the per-second hitch. The normal quest event flow (accept,
+            -- QUEST_LOG_UPDATE -> UpdateQuest) keeps objectives and spawnList current after this.
+            if not hasObjectives and not hasSpecial and not lastPopulateByQuestId[quest.Id] then
+                lastPopulateByQuestId[quest.Id] = GetTime()
+                QuestieQuest:PopulateQuestLogInfo(quest)
             end
         end
 

@@ -565,6 +565,20 @@ function QuestieCompat.GetQuestLogTitle(questLogIndex)
     local isDaily = ret[numReturns - 1]
     local questID = ret[numReturns]
 
+    -- Counting back from the end assumes the questId is the last value. Blizzard's own 3.3.5
+    -- code reads it as return 9 -- WatchFrame.lua does select(9, GetQuestLogTitle(index)) --
+    -- while QuestLogFrame.lua names a tenth, displayQuestID. A client that returns that tenth
+    -- value lands this on displayQuestID instead, and then every quest arrives with no id and
+    -- is skipped by the cache, the tracker and the watch hooks alike. Only used when the count
+    -- back produced nothing, so a client whose questId really is last is untouched.
+    if ((not questID) or questID == 0) and numReturns >= 9 and type(ret[9]) == "number" and ret[9] > 0 then
+        isHeader = ret[5]
+        isCollapsed = ret[6]
+        isComplete = ret[7]
+        isDaily = ret[8]
+        questID = ret[9]
+    end
+
     if (isComplete == nil and not isHeader) then
         local numObjectives = GetNumQuestLeaderBoards(questLogIndex)
         local requiredMoney = GetQuestLogRequiredMoney(questLogIndex)
@@ -2280,4 +2294,52 @@ SLASH_QUESTIEDEBUGALL1 = "/qdbgall"
 SlashCmdList["QUESTIEDEBUGALL"] = function()
     local anyOff = not (_G.QuestieDebugPlayerPosition and _G.QuestieDebugPlayerWorld and _G.QuestieDebugMinimapGate and _G.QuestieDebugMinimapPin)
     SetQuestieDebugGroup(anyOff)
+end
+
+-- One-shot quest tracking diagnostic. Prints, per quest log row, everything the tracking
+-- path depends on: how many values the client's GetQuestLogTitle actually returns, the
+-- questId Questie reads out of it, whether the quest reached currentQuestlog, whether the
+-- database knows it, and what the quest log's own Track button sees when it asks
+-- IsQuestWatched. A row that tracks correctly reads: id>0, log=yes, watched=true.
+SLASH_QUESTIETRACKDEBUG1 = "/qtrack"
+SlashCmdList["QUESTIETRACKDEBUG"] = function()
+    local QuestieTracker = QuestieLoader:ImportModule("QuestieTracker")
+
+    print("[QT] hooked:", tostring(QuestieTracker.alreadyHooked),
+        "secure:", tostring(QuestieTracker.alreadyHookedSecure),
+        "started:", tostring(QuestieTracker.started),
+        "questieIsQuestWatched:", tostring(QuestieTracker.IsQuestWatched ~= nil),
+        "autoTrack:", tostring(Questie.db.profile.autoTrackQuests))
+
+    local trackButton = _G.QuestLogFrameTrackButton or _G.QuestLogExFrameTrackButton
+    print("[QT] track button:", trackButton and trackButton:GetName() or "NOT FOUND",
+        "text:", (trackButton and trackButton.GetText and tostring(trackButton:GetText())) or "-",
+        "selection:", GetQuestLogSelection and tostring(GetQuestLogSelection()) or "-",
+        "UNTRACK_QUEST_ABBREV:", tostring(UNTRACK_QUEST_ABBREV))
+
+    local numEntries = select(1, GetNumQuestLogEntries()) or 0
+    print("[QT] quest log entries:", numEntries, "in currentQuestlog:", (function()
+        local count = 0
+        for _ in pairs(QuestiePlayer.currentQuestlog or {}) do count = count + 1 end
+        return count
+    end)())
+
+    for i = 1, numEntries do
+        local rawReturns = select("#", GetQuestLogTitle(i))
+        local title, _, _, isHeader, _, _, _, questId = QuestieCompat.GetQuestLogTitle(i)
+
+        if not isHeader then
+            local inLog = QuestiePlayer.currentQuestlog and questId and QuestiePlayer.currentQuestlog[questId]
+            local watchedOk, watched = pcall(IsQuestWatched, i)
+
+            print(string.format("[QT] %2d %-32s returns=%d id=%s log=%s db=%s watched=%s",
+                i,
+                tostring(title):sub(1, 32),
+                rawReturns,
+                tostring(questId),
+                (inLog and type(inLog) or "NO"),
+                tostring((questId and questId > 0 and QuestieDB.GetQuest(questId) ~= nil) or false),
+                watchedOk and tostring(watched) or ("ERROR: " .. tostring(watched))))
+        end
+    end
 end

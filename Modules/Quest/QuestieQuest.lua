@@ -620,6 +620,30 @@ function QuestieQuest:AcceptQuest(questId)
                 _UnloadAcceptedAvailableFrames(questId)
             end)
         end
+    else
+        -- Custom server content the database has never heard of. Everything downstream --
+        -- the tracker draw, IsQuestWatched, the arrow -- reads currentQuestlog, and the only
+        -- other place that registers a quest with no data is the login rebuild
+        -- (GetAllQuestIds), which is why these quests appeared after a /reload and not before.
+        -- Store the id on its own exactly as that rebuild does; the tracker builds an object
+        -- for it from the quest log.
+        Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestieQuest] AcceptQuest - not in database, tracking from the quest log:", questId)
+
+        if not QuestiePlayer.currentQuestlog[questId] then
+            QuestiePlayer.currentQuestlog[questId] = questId
+        end
+
+        -- A re-accepted quest must not stay hidden from a previous run.
+        if Questie.db.char.AutoUntrackedQuests then
+            Questie.db.char.AutoUntrackedQuests[questId] = nil
+        end
+        if Questie.db.char.collapsedQuests then
+            Questie.db.char.collapsedQuests[questId] = nil
+        end
+
+        QuestieCombatQueue:Queue(function()
+            QuestieTracker:Update()
+        end)
     end
 end
 
