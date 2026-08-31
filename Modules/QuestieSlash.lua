@@ -276,6 +276,7 @@ function QuestieSlash.HandleCommands(input)
         print(Questie:Colorize("/questie doable [questID] - " .. l10n("Prints whether you are eligibile to do a quest"), "yellow"));
         print(Questie:Colorize("/questie version - " .. l10n("Prints Questie and client version info"), "yellow"));
         print(Questie:Colorize("/questie learn [toggle/stats/clear/export] - " .. l10n("Self-learning database: toggle on/off, view stats, clear data, or export"), "yellow"));
+        print(Questie:Colorize("/questie arrow perf [start/stop/show/clear] - " .. "Arrow performance profiler: record, view, or clear timing data", "yellow"));
         return;
     end
 
@@ -426,6 +427,22 @@ function QuestieSlash.HandleCommands(input)
             end
         else
             Questie:Print("Usage: /questie learn [toggle/stats/clear/export]")
+        end
+        return
+    end
+
+    -- /questie arrow perf [start|stop|show|clear]
+    if mainCommand == "arrow" then
+        local QuestieArrow = QuestieLoader:ImportModule("QuestieArrow")
+        if subCommand == "perf" then
+            local action = commands[3] and string.lower(commands[3]) or ""
+            if QuestieArrow and QuestieArrow.HandlePerfCommand then
+                QuestieArrow:HandlePerfCommand(action)
+            else
+                Questie:Print("Arrow perf profiler not available.")
+            end
+        else
+            Questie:Print("Usage: /questie arrow perf [start|stop|show|clear]")
         end
         return
     end

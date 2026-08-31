@@ -261,6 +261,22 @@ function QuestieOptions.tabs.tracker:Initialize()
                             Questie.db.profile.trackerbindUntrack = key
                         end
                     },
+                    Space_Y2 = QuestieOptionsUtils:HorizontalSpacer(8.1, 0.1),
+                    focusQuest = {
+                        type = "select",
+                        order = 8.2,
+                        values = _GetShortcuts(),
+                        style = 'dropdown',
+                        name = function() return l10n('Focus Quest') end,
+                        desc = function()
+                            return l10n("This shortcut locks the Questie arrow to the clicked Quest and fades the other Quests' map icons. Use the same shortcut on the focused Quest, or right-click the arrow, to release it. The arrow returns to the nearest target when the Quest is turned in or abandoned.")
+                        end,
+                        disabled = function() return not Questie.db.profile.trackerEnabled end,
+                        get = function() return Questie.db.profile.trackerbindFocusQuest end,
+                        set = function(_, key)
+                            Questie.db.profile.trackerbindFocusQuest = key
+                        end
+                    },
                     Spacer_Sliders = QuestieOptionsUtils:Spacer(9),
                     questPadding = {
                         type = "range",

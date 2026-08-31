@@ -26,6 +26,10 @@ local QuestieMap = QuestieLoader:ImportModule("QuestieMap")
 local QuestieCombatQueue = QuestieLoader:ImportModule("QuestieCombatQueue")
 ---@type QuestieDB
 local QuestieDB = QuestieLoader:ImportModule("QuestieDB")
+---@type QuestieArrow
+local QuestieArrow = QuestieLoader:ImportModule("QuestieArrow")
+---@type QuestieQuest
+local QuestieQuest = QuestieLoader:ImportModule("QuestieQuest")
 ---@type QuestieLib
 local QuestieLib = QuestieLoader:ImportModule("QuestieLib");
 ---@type l10n
@@ -993,6 +997,21 @@ TrackerLinePool.OnClickQuest = function(self, button)
         local spawn, zone, name = QuestieMap:GetNearestQuestSpawn(self.Quest)
         if spawn then
             TrackerUtils:SetTomTomTarget(name, zone, spawn[1], spawn[2])
+        end
+    elseif TrackerUtils:IsBindTrue(Questie.db.profile.trackerbindFocusQuest, button) then
+        -- Locks the arrow to this quest. Clicking the focused quest again releases it.
+        if QuestieArrow and QuestieArrow.SetFocusedQuest then
+            if Questie.db.profile.arrowFocusedQuestId == self.Quest.Id then
+                QuestieArrow:ClearFocusedQuest() -- also lifts the tracker's icon fade
+            else
+                QuestieArrow:SetFocusedQuest(self.Quest.Id)
+                TrackerUtils:FocusQuest(self.Quest.Id)
+                QuestieQuest:ToggleNotes(false)
+            end
+
+            QuestieCombatQueue:Queue(function()
+                QuestieTracker:Update()
+            end)
         end
     elseif TrackerUtils:IsBindTrue(Questie.db.profile.trackerbindUntrack, button) then
         if (IsModifiedClick("CHATLINK") and ChatEdit_GetActiveWindow()) then

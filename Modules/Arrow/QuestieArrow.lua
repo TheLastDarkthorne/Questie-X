@@ -17,6 +17,8 @@ local QuestiePlayer = QuestieLoader:ImportModule("QuestiePlayer")
 local QuestieQuest = QuestieLoader:ImportModule("QuestieQuest")
 ---@type QuestieArrowAssets
 local QuestieArrowAssets = QuestieLoader:ImportModule("QuestieArrowAssets")
+---@type TrackerUtils
+local TrackerUtils = QuestieLoader:ImportModule("TrackerUtils")
 
 local HBD = QuestieCompat.HBD or LibStub("HereBeDragonsQuestie-2.0")
 local SharedMedia = LibStub and LibStub("LibSharedMedia-3.0", true)
@@ -51,6 +53,8 @@ local driverFrame = nil
 -- Current auto-tracked targets sorted by distance
 local sortedTargets = {}
 local hasManualTarget = false
+local _targetsDirty = true  -- when true, next Refresh rebuilds from quest data
+local _lastFocusComplete = nil  -- complete-state of the focused quest at the last rebuild
 
 -- Shared context written by UpdateNearestTargets, read by hoisted helpers.
 -- Avoids closure allocation on every call.
@@ -60,6 +64,49 @@ local _arrow_quest  -- current quest being processed by the hoisted helpers
 local _arrow_zoneUiMapCache = {}
 
 local lastPopulateByQuestId = {}
+
+-- Profiling buffer: nil when inactive, a table when recording.
+-- /questie arrow perf start  -> begins collecting samples
+-- /questie arrow perf stop   -> stops and saves to QuestieConfig.ArrowPerfLog (persists on /reload)
+-- /questie arrow perf show   -> prints summary of last run
+-- /questie arrow perf clear  -> wipes saved data (from memory and SavedVariables)
+local _arrowPerfLog = nil
+
+function QuestieArrow:HandlePerfCommand(action)
+    if action == "start" then
+        _arrowPerfLog = {}
+        print("|cff00ff00[Arrow Perf]|r Recording started. Play normally, then type /questie arrow perf stop")
+    elseif action == "stop" then
+        if not _arrowPerfLog then
+            print("|cffff0000[Arrow Perf]|r Not recording.")
+            return
+        end
+        QuestieConfig = QuestieConfig or {}
+        QuestieConfig.ArrowPerfLog = _arrowPerfLog
+        print(string.format("|cff00ff00[Arrow Perf]|r Stopped. %d samples saved. Type /questie arrow perf show for summary, or /reload to flush to disk.", #_arrowPerfLog))
+        _arrowPerfLog = nil
+    elseif action == "show" then
+        local log = (_arrowPerfLog) or (QuestieConfig and QuestieConfig.ArrowPerfLog)
+        if not log or #log == 0 then
+            print("|cffff0000[Arrow Perf]|r No data. Run /questie arrow perf start first.")
+            return
+        end
+        print(string.format("|cff00ff00[Arrow Perf]|r %d samples:", #log))
+        local startIdx = max(1, #log - 29)
+        for i = startIdx, #log do
+            print("  " .. log[i])
+        end
+        if startIdx > 1 then
+            print(string.format("  ... (%d earlier samples omitted, see WTF SavedVariables for full log)", startIdx - 1))
+        end
+    elseif action == "clear" then
+        _arrowPerfLog = nil
+        if QuestieConfig then QuestieConfig.ArrowPerfLog = nil end
+        print("|cff00ff00[Arrow Perf]|r Cleared.")
+    else
+        print("|cff00ff00[Arrow Perf]|r Usage: /questie arrow perf [start|stop|show|clear]")
+    end
+end
 
 local _GetBundledArrowStyle
 local _GetProfilePosition
@@ -151,6 +198,14 @@ local function _GetObjectiveGap()
         return 10
     end
     return Questie.db.profile.arrowObjectiveGap or 10
+end
+
+-- The quest the arrow is locked to, or nil when it should follow the nearest target.
+local function _GetFocusedQuestId()
+    if not Questie or not Questie.db or not Questie.db.profile then
+        return nil
+    end
+    return Questie.db.profile.arrowFocusedQuestId
 end
 
 local function _GetDistanceUnit()
@@ -702,7 +757,7 @@ EnsureObjectiveFrame = function()
         if button == "RightButton" then
             hasManualTarget = false
             sortedTargets = {}
-            QuestieArrow:Refresh()
+            QuestieArrow:ClearFocusedQuest()
         end
     end)
 
@@ -805,11 +860,12 @@ EnsureArrowFrame = function()
         if button == "RightButton" then
             hasManualTarget = false
             sortedTargets = {}
-            QuestieArrow:Refresh()
+            QuestieArrow:ClearFocusedQuest()
         end
     end)
 
     arrowFrame:SetScript("OnUpdate", function(self)
+        local _prof0 = _arrowPerfLog and debugprofilestop()
         local now = GetTime()
 
         local target = sortedTargets[1]
@@ -937,6 +993,15 @@ EnsureArrowFrame = function()
             self._lastTarget = target
             _UpdateObjectText(target)
         end
+
+        if _prof0 then
+            local _elapsed = debugprofilestop() - _prof0
+            if _elapsed > 1.0 then
+                local log = _arrowPerfLog
+                log[#log + 1] = string.format("%.3f OnUpdate %.2fms", now, _elapsed)
+                if #log > 500 then table.remove(log, 1) end
+            end
+        end
     end)
 
     arrowFrame:Hide()
@@ -962,7 +1027,7 @@ local function EnsureDriverFrame()
                 end
                 return
             end
-            QuestieArrow:Refresh()
+            QuestieArrow:Tick()
         end
     end)
 end
@@ -1072,8 +1137,47 @@ local function _CollectFinisherSpawns(finisher, quest)
     end
 end
 
+-- Exploration objectives are stored in questKeys.triggerEnd as
+-- {text, {[zoneId] = {{x, y}, ...}}}. Collected directly so "go to this place"
+-- quests still give the arrow a target even when no objective spawnList resolved.
+local function _CollectTriggerEnd(quest)
+    local triggerEnd = quest and quest.triggerEnd
+    local zones = triggerEnd and triggerEnd[2]
+    if type(zones) ~= "table" then return end
+
+    local pX, pY, pInst = _arrow_playerX, _arrow_playerY, _arrow_playerInstance
+    local iconPath = ResolveIconTexture(Questie.ICON_TYPE_EVENT)
+    local debugCollect = Questie and Questie.db and Questie.db.profile and Questie.db.profile.debugArrow
+
+    for zone, coordList in pairs(zones) do
+        local uiMapId = _GetUiMapIdForZone(zone)
+        if debugCollect then
+            print(string.format("    _CollectTriggerEnd: zone=%s uiMapId=%s", tostring(zone), tostring(uiMapId)))
+        end
+        if uiMapId and type(coordList) == "table" then
+            for _, coords in pairs(coordList) do
+                if type(coords) == "table" and coords[1] and coords[2] then
+                    local tX, tY, tInst = HBD:GetWorldCoordinatesFromZone(coords[1] / 100.0, coords[2] / 100.0, uiMapId)
+                    if tX and tY and tInst then
+                        local dist = HBD:GetWorldDistance(tInst, pX, pY, tX, tY)
+                        if dist then
+                            if tInst ~= pInst then
+                                dist = 500000 + dist * 100
+                            end
+                            if debugCollect then
+                                print(string.format("      ADDED triggerEnd (%.1f,%.1f) dist=%.0f", coords[1], coords[2], dist))
+                            end
+                            _AddArrowTarget(coords[1], coords[2], uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist)
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 local function _CollectObjective(objective, quest)
-    if not objective or not objective.spawnList then return end
+    if not objective then return end
     if QuestieQuest.ShouldHideObjective(objective) then return end
     if objective.Completed == true or objective.Completed == 1 then return end
     if objective.Needed and objective.Collected
@@ -1081,6 +1185,20 @@ local function _CollectObjective(objective, quest)
         and objective.Collected >= objective.Needed then
         return
     end
+
+    -- The spawnList is built lazily by PopulateObjectiveNotes, which the arrow never
+    -- calls. Build it here so objectives the map hasn't drawn yet still resolve.
+    if (not objective.spawnList) or (not next(objective.spawnList)) then
+        if QuestieQuest and QuestieQuest.BuildObjectiveSpawnList then
+            local objectiveData
+            if quest and quest.ObjectiveData and objective.Index then
+                objectiveData = quest.ObjectiveData[objective.Index]
+            end
+            QuestieQuest:BuildObjectiveSpawnList(objective, objectiveData)
+        end
+    end
+    if not objective.spawnList then return end
+
     local pX, pY, pInst = _arrow_playerX, _arrow_playerY, _arrow_playerInstance
     local autoLogic, pZone, pMap = _arrow_usingAutoLogic, _arrow_playerZoneId, _arrow_playerUiMapId
     local debugCollect = Questie and Questie.db and Questie.db.profile and Questie.db.profile.debugArrow
@@ -1141,13 +1259,63 @@ local function _CollectObjective(objective, quest)
 end
 
 -- Gather all objectives from tracked quests and sort by distance
+-- Fast path: update only distances and re-sort the existing target list.
+-- World coordinates on each target are static, so only the player position changes.
+local function _UpdateDistancesAndSort()
+    local playerX, playerY, playerInstance = HBD:GetPlayerWorldPosition()
+    if not playerX or not playerY or not playerInstance then
+        return
+    end
+    for i = 1, #sortedTargets do
+        local t = sortedTargets[i]
+        if t.worldX and t.worldY and t.worldInstance then
+            local dist = HBD:GetWorldDistance(t.worldInstance, playerX, playerY, t.worldX, t.worldY)
+            if dist then
+                if t.worldInstance ~= playerInstance then
+                    dist = 500000 + dist * 100
+                end
+                t.distance = dist
+            end
+        end
+    end
+    table.sort(sortedTargets, _SortTargetByDistance)
+end
+
 function QuestieArrow:UpdateNearestTargets()
     -- Don't override manual targets with auto-updates
     if hasManualTarget then
         return
     end
 
+    -- The focused quest can leave the log (turn-in, abandon) or flip to complete
+    -- between rebuilds. Both change which targets are valid, so check before the
+    -- fast path would hand back the cached list.
+    local focused = _GetFocusedQuestId()
+    if focused then
+        if not (QuestiePlayer and QuestiePlayer.currentQuestlog and QuestiePlayer.currentQuestlog[focused]) then
+            -- Turned in or abandoned: release the lock and fall back to nearest.
+            Questie.db.profile.arrowFocusedQuestId = nil
+            _lastFocusComplete = nil
+            _targetsDirty = true
+        else
+            local complete = QuestieDB.IsComplete(focused) == 1
+            if complete ~= _lastFocusComplete then
+                _lastFocusComplete = complete
+                _targetsDirty = true
+            end
+        end
+    elseif _lastFocusComplete ~= nil then
+        _lastFocusComplete = nil
+    end
+
+    -- Fast path: if the target list is still valid, just update distances.
+    if not _targetsDirty and #sortedTargets > 0 then
+        _UpdateDistancesAndSort()
+        return
+    end
+
     sortedTargets = {}
+    _targetsDirty = false
 
     if not Questie.db or not Questie.db.char then
         return
@@ -1171,6 +1339,9 @@ function QuestieArrow:UpdateNearestTargets()
     _arrow_playerX, _arrow_playerY, _arrow_playerInstance = playerX, playerY, playerInstance
     _arrow_usingAutoLogic = usingAutoLogic
     _arrow_playerZoneId, _arrow_playerUiMapId = playerZoneId, playerUiMapId
+
+    -- Already validated against the quest log at the top of this function.
+    local focusedQuestId = _GetFocusedQuestId()
 
     local function _CollectQuestTargets(quest)
         if not quest then return end
@@ -1199,7 +1370,11 @@ function QuestieArrow:UpdateNearestTargets()
             end
         end
 
-        local isComplete = quest.isComplete or (QuestieDB.IsComplete(quest.Id) == 1)
+        local countBefore = #sortedTargets
+
+        -- Quest objects are permanently cached, so quest.isComplete survives an
+        -- abandon/reaccept cycle. Read the quest log instead of trusting the flag.
+        local isComplete = QuestieDB.IsComplete(quest.Id) == 1
         if isComplete then quest.isComplete = true end
 
         if debugCollect then
@@ -1242,6 +1417,14 @@ function QuestieArrow:UpdateNearestTargets()
                 _CollectObjective(objective, quest)
             end
         end
+
+        -- Nothing resolved for this quest. Exploration quests keep their only
+        -- destination in triggerEnd, and a quest whose objectives the server hasn't
+        -- synced yet has no spawnList to read, so fall back to the raw coordinates.
+        if #sortedTargets == countBefore then
+            if debugCollect then print("    No targets from objectives, trying triggerEnd") end
+            _CollectTriggerEnd(quest)
+        end
     end
 
     if QuestiePlayer and QuestiePlayer.currentQuestlog then
@@ -1272,6 +1455,12 @@ function QuestieArrow:UpdateNearestTargets()
                 end
 
                 if shouldTrack then
+                    if focusedQuestId and questId ~= focusedQuestId then
+                        shouldTrack = false
+                    end
+                end
+
+                if shouldTrack then
                     if debugCollect then
                         print(string.format("  Calling _CollectQuestTargets for %s", tostring(quest.name)))
                     end
@@ -1285,19 +1474,8 @@ function QuestieArrow:UpdateNearestTargets()
     table.sort(sortedTargets, _SortTargetByDistance)
 end
 
-function QuestieArrow:Refresh()
-    if not _IsArrowEnabled() then
-        if arrowFrame then
-            arrowFrame:Hide()
-        end
-        if objectiveFrame then
-            objectiveFrame:Hide()
-        end
-        return
-    end
-
-    QuestieArrow:UpdateNearestTargets()
-
+-- Internal: shared rendering after targets are updated.
+local function _RenderArrow()
     EnsureArrowFrame()
     EnsureObjectiveFrame()
 
@@ -1320,6 +1498,64 @@ function QuestieArrow:Refresh()
         arrowFrame:Hide()
         objectiveFrame:Hide()
     end
+end
+
+-- Full refresh: rebuilds the target list from quest data. Called by external
+-- systems (quest accept, tracker hook, options changes) when quest state changes.
+function QuestieArrow:Refresh()
+    if not _IsArrowEnabled() then
+        if arrowFrame then
+            arrowFrame:Hide()
+        end
+        if objectiveFrame then
+            objectiveFrame:Hide()
+        end
+        return
+    end
+
+    _targetsDirty = true
+
+    local _t0, _t1
+    if _arrowPerfLog then _t0 = debugprofilestop() end
+
+    QuestieArrow:UpdateNearestTargets()
+
+    if _arrowPerfLog then
+        _t1 = debugprofilestop()
+        local log = _arrowPerfLog
+        log[#log + 1] = string.format("%.3f Refresh targets=%d scan=%.2fms",
+            GetTime(), #sortedTargets, _t1 - _t0)
+        if #log > 500 then table.remove(log, 1) end
+    end
+
+    _RenderArrow()
+end
+
+-- Lightweight tick: only updates distances and re-sorts the existing target list.
+-- Called by the driver frame every recalc interval. Falls back to a full rebuild
+-- if the target list is empty (first run, or after ClearTarget).
+function QuestieArrow:Tick()
+    if not _IsArrowEnabled() then
+        if arrowFrame then
+            arrowFrame:Hide()
+        end
+        return
+    end
+
+    local _t0, _t1
+    if _arrowPerfLog then _t0 = debugprofilestop() end
+
+    QuestieArrow:UpdateNearestTargets()
+
+    if _arrowPerfLog then
+        _t1 = debugprofilestop()
+        local log = _arrowPerfLog
+        log[#log + 1] = string.format("%.3f Tick targets=%d dist=%.2fms",
+            GetTime(), #sortedTargets, _t1 - _t0)
+        if #log > 500 then table.remove(log, 1) end
+    end
+
+    _RenderArrow()
 end
 
 -- Manual target setting (called from tracker TomTom bind)
@@ -1350,9 +1586,38 @@ function QuestieArrow:SetTarget(title, zoneOrUiMapId, x, y)
     objectiveFrame:Show()
 end
 
+function QuestieArrow:SetFocusedQuest(questId)
+    if not Questie or not Questie.db or not Questie.db.profile then
+        return
+    end
+    Questie.db.profile.arrowFocusedQuestId = questId
+    hasManualTarget = false
+    _targetsDirty = true
+    QuestieArrow:Refresh()
+end
+
+function QuestieArrow:ClearFocusedQuest()
+    if Questie and Questie.db and Questie.db.profile then
+        Questie.db.profile.arrowFocusedQuestId = nil
+    end
+    _targetsDirty = true
+
+    -- Focusing a quest also fades the other quests' map icons, so releasing the
+    -- arrow has to lift that too or the map stays dimmed with nothing focused.
+    if TrackerUtils and TrackerUtils.UnFocus and Questie and Questie.db and Questie.db.char and Questie.db.char.TrackerFocus then
+        TrackerUtils:UnFocus()
+        if QuestieQuest and QuestieQuest.ToggleNotes then
+            QuestieQuest:ToggleNotes(true)
+        end
+    end
+
+    QuestieArrow:Refresh()
+end
+
 function QuestieArrow:ClearTarget()
     hasManualTarget = false
     sortedTargets = {}
+    _targetsDirty = true
 
     if arrowFrame then
         arrowFrame:Hide()
@@ -1534,6 +1799,7 @@ function QuestieArrow:Initialize()
             end
 
             lastTrackerRefresh = now
+            _targetsDirty = true
             QuestieArrow:Refresh()
         end)
     end

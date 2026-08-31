@@ -24,6 +24,8 @@ local QuestieCombatQueue = QuestieLoader:ImportModule("QuestieCombatQueue")
 local QuestieLib = QuestieLoader:ImportModule("QuestieLib")
 ---@type QuestieDB
 local QuestieDB = QuestieLoader:ImportModule("QuestieDB")
+---@type QuestieArrow
+local QuestieArrow = QuestieLoader:ImportModule("QuestieArrow")
 
 ---@type l10n
 local l10n = QuestieLoader:ImportModule("l10n")
@@ -283,6 +285,9 @@ TrackerMenu.addFocusUnfocusOption = function(menu, quest)
                 LibDropDown:CloseDropDownMenus()
                 TrackerUtils:UnFocus()
                 QuestieQuest:ToggleNotes(true)
+                if QuestieArrow and QuestieArrow.ClearFocusedQuest then
+                    QuestieArrow:ClearFocusedQuest()
+                end
             end
         })
     else
@@ -292,6 +297,11 @@ TrackerMenu.addFocusUnfocusOption = function(menu, quest)
                 LibDropDown:CloseDropDownMenus()
                 TrackerUtils:FocusQuest(quest.Id)
                 QuestieQuest:ToggleNotes(false)
+                -- Focusing a quest should move the arrow too, the same way the
+                -- Focus Quest shortcut does.
+                if QuestieArrow and QuestieArrow.SetFocusedQuest then
+                    QuestieArrow:SetFocusedQuest(quest.Id)
+                end
             end
         })
     end

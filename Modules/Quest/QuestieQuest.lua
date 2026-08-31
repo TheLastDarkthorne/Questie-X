@@ -2389,7 +2389,13 @@ function QuestieQuest:PopulateQuestLogInfo(quest)
     local objectiveIndex, objective = next(questObjectives)
     while objectiveIndex do
         if objective.type and string.len(objective.type) > 1 then
-            if (not quest.ObjectiveData) or (not quest.ObjectiveData[objectiveIndex]) or (not quest.ObjectiveData[objectiveIndex].Id) then
+            local objData = quest.ObjectiveData and quest.ObjectiveData[objectiveIndex]
+            -- Event objectives ("explore this place", from questKeys.triggerEnd) carry no
+            -- Id, only Type and Coordinates. They are still real objective data, so they
+            -- must not be routed to the fallback branch: the fallback drops Coordinates,
+            -- which leaves objectiveSpawnListCallTable["event"] with nothing to build from.
+            local objDataUsable = objData ~= nil and (objData.Id ~= nil or (objData.Type == "event" and objData.Coordinates ~= nil))
+            if not objDataUsable then
                 Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestieQuest] Missing objective data for quest", quest.Id, objective.text, "creating fallback objective")
                 if not quest.Objectives[objectiveIndex] then
                     local fallbackSpawnList = {}
@@ -2440,7 +2446,7 @@ function QuestieQuest:PopulateQuestLogInfo(quest)
             else
                 if not quest.Objectives[objectiveIndex] then
                     quest.Objectives[objectiveIndex] = {
-                        Id = quest.ObjectiveData[objectiveIndex].Id,
+                        Id = quest.ObjectiveData[objectiveIndex].Id or 0, -- event objectives have no Id
                         Index = objectiveIndex,
                         questId = quest.Id,
                         _lastUpdate = 0,
