@@ -153,7 +153,7 @@ QuestLogCache._GetNewObjectives = GetNewObjectives
 
 -- Reads the quest log as it stands. Call through QuestLogCache.CheckForChanges, which makes sure
 -- the whole log is walkable first.
-local function CheckForChanges(questIdsToCheck)
+local function CheckForChanges(questIdsToCheck, quiet)
     local cacheMiss = false
     local changes = {}
     local questIdsChecked = {}
@@ -267,7 +267,9 @@ local function CheckForChanges(questIdsToCheck)
     end
 
     -- Debug / warning: ignore questId=0 and don't treat it as "missing" when the log has weird entries
-    if questIdsToCheck then
+    -- quiet is for callers that are asking precisely because they do not yet know whether the quest
+    -- has arrived in the log; for them an absence is an expected answer, not something to report.
+    if questIdsToCheck and (not quiet) then
         local questId, _ = next(questIdsToCheck)
         while questId do
             if questId and questId > 0 and (not questIdsChecked[questId]) then
@@ -285,13 +287,14 @@ end
 --- Called only from QuestEventHandler.
 ---@param questIdsToCheck table? @keys are the questIds
 ---@param forceFullLog boolean? @bypass the expand throttle; for the login read
+---@param quiet boolean? @do not warn about a requested quest the walk did not find
 ---@return boolean cacheMiss, table changes @cacheMiss = couldn't get all required data  ; changes[questId] = list of changed objectiveIndexes (may be an empty list if quest has no objectives)
-function QuestLogCache.CheckForChanges(questIdsToCheck, forceFullLog)
+function QuestLogCache.CheckForChanges(questIdsToCheck, forceFullLog, quiet)
     -- A collapsed header hides its quests from the walk below, and this is the only thing that
     -- puts a quest into the cache -- so without expanding first, a quest the player accepted
     -- under a shut header is never cached, never reaches currentQuestlog, and never draws.
     return QuestieCompat.WithFullQuestLog(function()
-        return CheckForChanges(questIdsToCheck)
+        return CheckForChanges(questIdsToCheck, quiet)
     end, forceFullLog)
 end
 

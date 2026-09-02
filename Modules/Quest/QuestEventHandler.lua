@@ -334,23 +334,54 @@ end
 function _QuestEventHandler:HandleQuestAccepted(questId)
     Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestEventHandler] HandleQuestAccepted - questId:", questId)
     local idx = QuestieCompat.GetQuestLogIndexByID(questId)
-    if not idx then
-        Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestEventHandler] HandleQuestAccepted - NO quest log index yet, retrying for questId:", questId)
-        _QuestLogUpdateQueue:Insert(function()
-            return _QuestEventHandler:HandleQuestAccepted(questId)
-        end)
-        return false
-    end
-    -- We first check the quest objectives and retry in the next QLU event if they are not correct yet
-    local cacheMiss, changes = QuestLogCache.CheckForChanges({ [questId] = true })
-    if cacheMiss then
-        -- if cacheMiss, no need to check changes as only 1 questId
-        Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestEventHandler] HandleQuestAccepted - CACHE MISS for questId:", questId, "- retrying later")
-        _QuestLogUpdateQueue:Insert(function()
-            return _QuestEventHandler:HandleQuestAccepted(questId)
-        end)
+    -- "No log index" means two different things on 3.3.5, and only one of them is worth retrying.
+    -- Either the quest has not landed in the log yet, or it landed under a collapsed header --
+    -- which removes that header's quests from the index space entirely, so retrying finds nothing
+    -- for as long as the header stays shut. Custom-server quests arrive under exactly such a
+    -- header ("Missing header! (quest designers)"), which is why they only appeared in the tracker
+    -- after the player expanded it by hand.
+    local readyFromCache = false
 
-        return false
+    if not idx then
+        -- Only when a header is actually collapsed is there anything to do differently. On a fully
+        -- expanded log this whole branch is skipped and the behaviour below is unchanged.
+        if QuestieCompat.IsQuestLogPartial and QuestieCompat.IsQuestLogPartial() then
+            -- QuestLogCache is the only collapse-proof read of the log there is: it expands every
+            -- header, reads, and puts the player's collapse state back exactly. Forced past the
+            -- expand throttle, because a throttled read would hand back the same partial log and
+            -- the retry would arrive right back here. Scoped to this one quest so no other quest's
+            -- objective changes are computed and then dropped on the floor, and quiet because an
+            -- absence is the expected answer in the "not in the log yet" case, not a fault to
+            -- report to the player.
+            QuestLogCache.CheckForChanges({ [questId] = true }, true, true)
+            readyFromCache = QuestLogCache.questLog_DO_NOT_MODIFY[questId] ~= nil
+        end
+
+        if not readyFromCache then
+            Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestEventHandler] HandleQuestAccepted - NO quest log index yet, retrying for questId:", questId)
+            -- Never bounded. Giving up leaves the quest out of the tracker for the rest of the
+            -- session, and expanding the header afterwards does not bring it back.
+            _QuestLogUpdateQueue:Insert(function()
+                return _QuestEventHandler:HandleQuestAccepted(questId)
+            end)
+            return false
+        end
+
+        Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestEventHandler] HandleQuestAccepted - questId:", questId, "is behind a collapsed header, proceeding from the cache")
+    end
+
+    if not readyFromCache then
+        -- We first check the quest objectives and retry in the next QLU event if they are not correct yet
+        local cacheMiss, changes = QuestLogCache.CheckForChanges({ [questId] = true })
+        if cacheMiss then
+            -- if cacheMiss, no need to check changes as only 1 questId
+            Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestEventHandler] HandleQuestAccepted - CACHE MISS for questId:", questId, "- retrying later")
+            _QuestLogUpdateQueue:Insert(function()
+                return _QuestEventHandler:HandleQuestAccepted(questId)
+            end)
+
+            return false
+        end
     end
 
     Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestEventHandler] HandleQuestAccepted - cache ready, calling AcceptQuest for questId:", questId)
