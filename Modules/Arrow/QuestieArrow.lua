@@ -19,6 +19,8 @@ local QuestieQuest = QuestieLoader:ImportModule("QuestieQuest")
 local QuestieArrowAssets = QuestieLoader:ImportModule("QuestieArrowAssets")
 ---@type TrackerUtils
 local TrackerUtils = QuestieLoader:ImportModule("TrackerUtils")
+---@type QuestLogCache
+local QuestLogCache = QuestieLoader:ImportModule("QuestLogCache")
 
 local HBD = QuestieCompat.HBD or LibStub("HereBeDragonsQuestie-2.0")
 local SharedMedia = LibStub and LibStub("LibSharedMedia-3.0", true)
@@ -62,6 +64,10 @@ local _arrow_playerX, _arrow_playerY, _arrow_playerInstance
 local _arrow_usingAutoLogic, _arrow_playerZoneId, _arrow_playerUiMapId
 local _arrow_quest  -- current quest being processed by the hoisted helpers
 local _arrow_zoneUiMapCache = {}
+-- questId -> true for every quest the game itself reports as complete. Rebuilt once per
+-- full target scan; the alternative (GetQuestLogIndexByID per quest) is O(n^2) over the
+-- quest log and this runs on the arrow's per-second path.
+local _arrow_logComplete = {}
 
 local lastPopulateByQuestId = {}
 
@@ -114,11 +120,39 @@ local _GetObjectiveProfilePosition
 local EnsureObjectiveFrame
 local EnsureArrowFrame
 
+-- Mirrors the tracker's hideTrackerInDungeons: a bare IsInInstance() covers dungeons and
+-- raids, and battlegrounds and arenas along with them, which is what the tracker has always
+-- done for the same setting.
+local function _IsInHiddenInstance()
+    if not Questie or not Questie.db or not Questie.db.profile then
+        return false
+    end
+    if Questie.db.profile.arrowHideInInstances == false then
+        return false
+    end
+    return IsInInstance() and true or false
+end
+
 local function _IsArrowEnabled()
     if not Questie or not Questie.db or not Questie.db.profile then
         return true
     end
-    return Questie.db.profile.arrowEnabled ~= false
+    if Questie.db.profile.arrowEnabled == false then
+        return false
+    end
+    -- Every entry point -- driver tick, Refresh, SetTarget, the tracker hook -- routes
+    -- through here, so refusing once stops the frames showing and stops the target scan
+    -- running at all while the player is inside an instance.
+    return not _IsInHiddenInstance()
+end
+
+local function _HideArrowFrames()
+    if arrowFrame then
+        arrowFrame:Hide()
+    end
+    if objectiveFrame then
+        objectiveFrame:Hide()
+    end
 end
 
 local function _GetProfileNumber(key, defaultValue, minValue, maxValue)
@@ -253,7 +287,9 @@ local function _GetUiMapIdForZone(zone)
     return uiMapId
 end
 
-local function _AddArrowTarget(x, y, uiMapId, title, questLevel, iconPath, worldX, worldY, worldInstance, distance)
+-- questId/source are carried purely so a target can be traced back to what produced it
+-- (/questie arrow why). Nothing in the rendering path reads them.
+local function _AddArrowTarget(x, y, uiMapId, title, questLevel, iconPath, worldX, worldY, worldInstance, distance, questId, source)
     table.insert(sortedTargets, {
         x = x,
         y = y,
@@ -265,6 +301,8 @@ local function _AddArrowTarget(x, y, uiMapId, title, questLevel, iconPath, world
         worldY = worldY,
         worldInstance = worldInstance,
         distance = distance,
+        questId = questId,
+        source = source,
     })
 end
 
@@ -1022,12 +1060,22 @@ local function EnsureDriverFrame()
         if (self._lastRecalc or 0) + _GetArrowRecalcInterval() < now then
             self._lastRecalc = now
             if not _IsArrowEnabled() then
-                if arrowFrame then
-                    arrowFrame:Hide()
-                end
+                _HideArrowFrames()
                 return
             end
             QuestieArrow:Tick()
+        end
+    end)
+
+    -- Zoning is the only thing that changes the instance answer, and waiting for the next
+    -- recalc interval would leave the arrow on screen through the loading screen fade.
+    driverFrame:RegisterEvent("PLAYER_ENTERING_WORLD")
+    driverFrame:RegisterEvent("ZONE_CHANGED_NEW_AREA")
+    driverFrame:SetScript("OnEvent", function()
+        if _IsArrowEnabled() then
+            QuestieArrow:Refresh()
+        else
+            _HideArrowFrames()
         end
     end)
 end
@@ -1079,7 +1127,7 @@ local function _CollectFinisherSpawns(finisher, quest)
                                                     if tInst ~= pInst then
                                                         dist = 500000 + dist * 100
                                                     end
-                                                    _AddArrowTarget(x, y, uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist)
+                                                    _AddArrowTarget(x, y, uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist, quest.Id, "finisher")
                                                 end
                                             end
                                         end
@@ -1100,7 +1148,7 @@ local function _CollectFinisherSpawns(finisher, quest)
                                             if tInst ~= pInst then
                                                 dist = 500000 + dist * 100
                                             end
-                                            _AddArrowTarget(x, y, uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist)
+                                            _AddArrowTarget(x, y, uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist, quest.Id, "finisher")
                                         end
                                     end
                                 end
@@ -1127,7 +1175,7 @@ local function _CollectFinisherSpawns(finisher, quest)
                                 if tInst ~= pInst then
                                     dist = 500000 + dist * 100
                                 end
-                                _AddArrowTarget(x, y, uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist)
+                                _AddArrowTarget(x, y, uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist, quest.Id, "finisher")
                             end
                         end
                     end
@@ -1137,6 +1185,64 @@ local function _CollectFinisherSpawns(finisher, quest)
     end
 end
 
+-- The game's own view of which quests are turned-in-ready. QuestieDB.IsComplete answers
+-- from QuestLogCache, which has been stale for whole classes of quest before now, so the
+-- arrow keeps an independent read: if the player's quest log says Complete, the arrow
+-- points at the finisher no matter what the addon's caches believe.
+local function _RefreshQuestLogCompleteMap()
+    for questId in pairs(_arrow_logComplete) do
+        _arrow_logComplete[questId] = nil
+    end
+
+    local numEntries = select(1, GetNumQuestLogEntries()) or 0
+    for i = 1, numEntries do
+        local _, _, _, isHeader, _, isComplete, _, questId = QuestieCompat.GetQuestLogTitle(i)
+        if (not isHeader) and questId and questId > 0 and isComplete == 1 then
+            _arrow_logComplete[questId] = true
+        end
+    end
+end
+
+-- True once the player has reached the place a triggerEnd points at. Read from the quest
+-- log rather than from quest.Objectives[].Completed, which only refreshes after
+-- QuestieQuest:SetObjectivesDirty and so can lag a step behind.
+local function _IsExplorationDone(quest)
+    -- Empty on a cache miss, and empty for a quest whose objectives the server has not
+    -- synced yet. Neither says the destination has been reached, so both fall through to
+    -- the quest.Objectives check below and, failing that, let the caller collect.
+    local objectives = QuestLogCache.GetQuestObjectives(quest.Id) or {}
+
+    local sawEvent = false
+    for i = 1, table.getn(objectives) do
+        local o = objectives[i]
+        if o and o.type == "event" then
+            sawEvent = true
+            local reached = o.finished == true
+            if (not reached) and o.numRequired and o.numFulfilled and o.numRequired > 0 then
+                reached = o.numFulfilled >= o.numRequired
+            end
+            if not reached then
+                return false
+            end
+        end
+    end
+
+    if sawEvent then
+        return true
+    end
+
+    -- No event line in the quest log. The matching quest.Objectives entry is the only
+    -- other place the state can live.
+    for _, objective in pairs(quest.Objectives or {}) do
+        if objective and objective.Type == "event"
+            and (objective.Completed == true or objective.Completed == 1) then
+            return true
+        end
+    end
+
+    return false
+end
+
 -- Exploration objectives are stored in questKeys.triggerEnd as
 -- {text, {[zoneId] = {{x, y}, ...}}}. Collected directly so "go to this place"
 -- quests still give the arrow a target even when no objective spawnList resolved.
@@ -1144,6 +1250,18 @@ local function _CollectTriggerEnd(quest)
     local triggerEnd = quest and quest.triggerEnd
     local zones = triggerEnd and triggerEnd[2]
     if type(zones) ~= "table" then return end
+
+    -- This is the one collector with no completion filter of its own: it reads the raw
+    -- database coordinates, so nothing upstream stops it re-pinning the arrow to a place
+    -- the player has already been. Reached from the "this quest resolved no targets"
+    -- fallback, which is exactly what a *correctly* filtered-out exploration objective
+    -- produces, so the filter's own success used to trigger the unfiltered path.
+    if _arrow_logComplete[quest.Id] or _IsExplorationDone(quest) then
+        if Questie and Questie.db and Questie.db.profile and Questie.db.profile.debugArrow then
+            print("    _CollectTriggerEnd: skipped, destination already reached")
+        end
+        return
+    end
 
     local pX, pY, pInst = _arrow_playerX, _arrow_playerY, _arrow_playerInstance
     local iconPath = ResolveIconTexture(Questie.ICON_TYPE_EVENT)
@@ -1167,7 +1285,7 @@ local function _CollectTriggerEnd(quest)
                             if debugCollect then
                                 print(string.format("      ADDED triggerEnd (%.1f,%.1f) dist=%.0f", coords[1], coords[2], dist))
                             end
-                            _AddArrowTarget(coords[1], coords[2], uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist)
+                            _AddArrowTarget(coords[1], coords[2], uiMapId, quest.name, quest.level, iconPath, tX, tY, tInst, dist, quest.Id, "triggerEnd")
                         end
                     end
                 end
@@ -1246,7 +1364,9 @@ local function _CollectObjective(objective, quest)
                                         tX,
                                         tY,
                                         tInst,
-                                        dist
+                                        dist,
+                                        quest.Id,
+                                        "objective"
                                     )
                                 end
                             end
@@ -1334,6 +1454,7 @@ function QuestieArrow:UpdateNearestTargets()
     local playerZoneId = QuestiePlayer:GetCurrentZoneId()
     local playerUiMapId = QuestiePlayer:GetCurrentUiMapId()
     _arrow_zoneUiMapCache = {}
+    _RefreshQuestLogCompleteMap()
 
     -- Publish context for hoisted helper functions (avoids closure allocation every call)
     _arrow_playerX, _arrow_playerY, _arrow_playerInstance = playerX, playerY, playerInstance
@@ -1374,7 +1495,10 @@ function QuestieArrow:UpdateNearestTargets()
 
         -- Quest objects are permanently cached, so quest.isComplete survives an
         -- abandon/reaccept cycle. Read the quest log instead of trusting the flag.
-        local isComplete = QuestieDB.IsComplete(quest.Id) == 1
+        -- QuestieDB.IsComplete answers from QuestLogCache, so _arrow_logComplete stands in
+        -- for it whenever that cache disagrees with what the player sees in their own quest
+        -- log -- otherwise a quest the game calls Complete keeps producing objective targets.
+        local isComplete = QuestieDB.IsComplete(quest.Id) == 1 or _arrow_logComplete[quest.Id] == true
         if isComplete then quest.isComplete = true end
 
         if debugCollect then
@@ -1504,12 +1628,7 @@ end
 -- systems (quest accept, tracker hook, options changes) when quest state changes.
 function QuestieArrow:Refresh()
     if not _IsArrowEnabled() then
-        if arrowFrame then
-            arrowFrame:Hide()
-        end
-        if objectiveFrame then
-            objectiveFrame:Hide()
-        end
+        _HideArrowFrames()
         return
     end
 
@@ -1536,9 +1655,7 @@ end
 -- if the target list is empty (first run, or after ClearTarget).
 function QuestieArrow:Tick()
     if not _IsArrowEnabled() then
-        if arrowFrame then
-            arrowFrame:Hide()
-        end
+        _HideArrowFrames()
         return
     end
 
@@ -1795,6 +1912,11 @@ function QuestieArrow:Initialize()
 
             local now = GetTime()
             if (lastTrackerRefresh + _GetArrowTrackerRefreshThrottle()) > now then
+                -- Defer, don't drop. A refresh rejected by the throttle still carries real
+                -- quest state, and returning without marking dirty threw it away for good:
+                -- Tick() never sets the flag itself, so the driver's fast path would re-sort
+                -- distances forever against a list built before the objective completed.
+                _targetsDirty = true
                 return
             end
 
@@ -1820,6 +1942,76 @@ function QuestieArrow:PrintTargetCoords()
     print("  Zone Coords: " .. string.format("%.1f, %.1f", target.x, target.y))
     print("  UI Map ID: " .. tostring(target.uiMapId))
     print("  Distance: " .. _FormatDistance(target.distance or 0))
+end
+
+-- Explains the current target: which quest and which collector produced it, and what each
+-- layer of completion state says about that quest. The layers are meant to agree; when the
+-- arrow is stuck they do not, and this says which one is lying.
+function QuestieArrow:PrintWhy()
+    if hasManualTarget then
+        print("Questie Arrow: manual target set (tracker TomTom bind) -- quest state is not consulted.")
+    end
+    if not sortedTargets or not sortedTargets[1] then
+        print("Questie Arrow: No target currently set!")
+        return
+    end
+
+    local target = sortedTargets[1]
+    local questId = target.questId
+    print("=== Questie Arrow: why this target ===")
+    print(string.format("  Quest: %s (id %s)", tostring(target.title), tostring(questId)))
+    print(string.format("  Source: %s", tostring(target.source)))
+    print(string.format("  Zone coords: %.1f, %.1f  uiMapId %s  dist %s",
+        target.x or 0, target.y or 0, tostring(target.uiMapId), _FormatDistance(target.distance or 0)))
+
+    if not questId then
+        print("  (target carries no quest id -- nothing further to report)")
+        print("=====================================")
+        return
+    end
+
+    local logIndex = QuestieCompat.GetQuestLogIndexByID(questId)
+    local logComplete
+    if logIndex then
+        logComplete = select(6, QuestieCompat.GetQuestLogTitle(logIndex))
+    end
+    print(string.format("  Game quest log isComplete: %s (log index %s)",
+        tostring(logComplete), tostring(logIndex)))
+    print(string.format("  QuestieDB.IsComplete: %s", tostring(QuestieDB.IsComplete(questId))))
+
+    local cached = QuestLogCache.GetQuest(questId)
+    if cached then
+        print(string.format("  QuestLogCache isComplete: %s", tostring(cached.isComplete)))
+        local objectives = cached.objectives or {}
+        print(string.format("  QuestLogCache objectives: %d", table.getn(objectives)))
+        for i = 1, table.getn(objectives) do
+            local o = objectives[i]
+            print(string.format("    [%d] type=%s finished=%s %s/%s",
+                i, tostring(o.type), tostring(o.finished),
+                tostring(o.numFulfilled), tostring(o.numRequired)))
+        end
+    else
+        print("  QuestLogCache: no entry")
+    end
+
+    local quest = QuestieDB.GetQuest(questId)
+    if quest then
+        local count = 0
+        for index, objective in pairs(quest.Objectives or {}) do
+            count = count + 1
+            print(string.format("  Objectives[%s] type=%s Completed=%s %s/%s",
+                tostring(index), tostring(objective.Type), tostring(objective.Completed),
+                tostring(objective.Collected), tostring(objective.Needed)))
+        end
+        if count == 0 then
+            print("  Objectives: none populated")
+        end
+        print(string.format("  triggerEnd: %s", quest.triggerEnd and "yes" or "no"))
+        print(string.format("  Finisher: %s", quest.Finisher and tostring(quest.Finisher.Id) or "none"))
+    else
+        print("  QuestieDB.GetQuest returned nil")
+    end
+    print("=====================================")
 end
 
 function QuestieArrow:DebugPrint()

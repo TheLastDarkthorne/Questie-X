@@ -243,8 +243,10 @@ local INIT_QUEST_LOG_MAX_ATTEMPTS = 10
 function _QuestEventHandler:InitQuestLog(attempt)
     attempt = attempt or 1
 
-    -- Fill the QuestLogCache for first time
-    local cacheMiss, changes = QuestLogCache.CheckForChanges(nil)
+    -- Fill the QuestLogCache for first time. Forced past the expand throttle: this read is what
+    -- decides which quests exist for the rest of the session, so it has to see the whole log even
+    -- if the player logged in with headers collapsed.
+    local cacheMiss, changes = QuestLogCache.CheckForChanges(nil, true)
 
     -- Whatever was read is valid even when the rest of the log was not ready, so it is marked
     -- before any retry. The previous version returned here and threw these away.
@@ -558,9 +560,47 @@ function _QuestEventHandler:MarkQuestAsAbandoned(questId)
     end
 end
 
+-- 3.3.5 ships with Lua error display off, so an error thrown inside an event handler disappears
+-- without a trace: no popup, no chat line, nothing anywhere. The two reconciliation passes below
+-- run one after the other from QUEST_LOG_UPDATE, so an error in the first would silently stop the
+-- second from ever running -- and from the outside that is indistinguishable from a pass that ran
+-- and correctly found nothing to do. Each is guarded so it cannot take the other down with it, and
+-- what each one saw is recorded so /questie why can tell those two cases apart.
+QuestEventHandler.reconcileStats = {
+    logUpdates = 0,
+    cleanupRuns = 0,
+    cleanupError = nil,
+    registerRuns = 0,
+    registerError = nil,
+    lastAdded = 0,
+    totalAdded = 0,
+    lastCacheCount = 0,
+    lastPartial = nil,
+    lastVetoed = 0,
+}
+
+local function _RunReconcilePasses()
+    local stats = QuestEventHandler.reconcileStats
+
+    stats.cleanupRuns = stats.cleanupRuns + 1
+    local cleanupOk, cleanupErr = pcall(function()
+        _QuestEventHandler:CleanupRemovedQuestsFallback()
+    end)
+    stats.cleanupError = (not cleanupOk) and tostring(cleanupErr) or nil
+
+    -- The two act on disjoint sets -- one takes quests that are gone from the log, the other adds
+    -- quests that are in it -- so neither can undo the other.
+    stats.registerRuns = stats.registerRuns + 1
+    local registerOk, registerErr = pcall(function()
+        _QuestEventHandler:RegisterMissingQuestsFallback()
+    end)
+    stats.registerError = (not registerOk) and tostring(registerErr) or nil
+end
+
 ---Fires when the quest log changed in any way. This event fires very often!
 function _QuestEventHandler:QuestLogUpdate()
     Questie:Debug(Questie.DEBUG_DEVELOP, "[Quest Event] QUEST_LOG_UPDATE")
+    QuestEventHandler.reconcileStats.logUpdates = QuestEventHandler.reconcileStats.logUpdates + 1
 
     local continueQueuing = true
     -- Some of the other quest event didn't have the required information and ordered to wait for the next QLU.
@@ -576,9 +616,9 @@ function _QuestEventHandler:QuestLogUpdate()
         -- Also on this path: UpdateAllQuests only looks at quests still in the log, so a removal
         -- that fired no event of its own would sit there unnoticed for as long as full scans keep
         -- being asked for.
-        _QuestEventHandler:CleanupRemovedQuestsFallback()
+        _RunReconcilePasses()
     else
-        _QuestEventHandler:CleanupRemovedQuestsFallback()
+        _RunReconcilePasses()
         QuestieCombatQueue:Queue(function()
             QuestieTracker:Update()
         end)
@@ -678,6 +718,17 @@ end
 -- Fallback cleanup: some servers remove quests without firing QUEST_REMOVED reliably.
 -- This compares Questie's currentQuestlog vs the game's quest log and removes stale quests.
 function _QuestEventHandler:CleanupRemovedQuestsFallback()
+    -- This runs on every QUEST_LOG_UPDATE, and collapsing a header fires one -- so it cannot
+    -- expand the log itself without driving the event in a loop. It can refuse to act on a log it
+    -- knows is incomplete: a collapsed header takes its quests out of the walk below, and every
+    -- one of them would then be read as removed and filed as abandoned. Doing nothing for as long
+    -- as a header is shut only delays the cleanup of a quest that really did go.
+    if QuestieCompat.IsQuestLogPartial() then
+        Questie:Debug(Questie.DEBUG_DEVELOP,
+            "[CleanupRemovedQuestsFallback] Quest log has collapsed headers, skipping removal pass")
+        return
+    end
+
     local gameQuestIds = {}
     local numEntries = select(1, GetNumQuestLogEntries()) or 0
     for questLogIndex = 1, numEntries do
@@ -735,6 +786,102 @@ function _QuestEventHandler:CleanupRemovedQuestsFallback()
             end)
         end
     end
+end
+
+-- The mirror of CleanupRemovedQuestsFallback: a quest the player has that Questie never took a
+-- record of. currentQuestlog is built once at login, by GetAllQuestIds, out of whatever
+-- QuestLogCache happened to hold at that moment -- and the client fills that cache in waves,
+-- because CheckForChanges skips a quest whose objective text the server has not sent yet. A quest
+-- that lands in the cache after the last rebuild is then in the cache and in nothing else:
+-- UpdateAllQuests only ever revisits quests it already knows, and after login the only things that
+-- add to currentQuestlog are accepting a quest and the tracker's own fallback path. The tracker,
+-- the arrow and IsQuestWatched all read currentQuestlog, so such a quest stays invisible for the
+-- rest of the session however many times the log updates.
+--
+-- Registering it here is the same work the login rebuild does, so a quest that arrives late ends
+-- up indistinguishable from one that arrived on time.
+--
+-- Driven from QuestLogCache rather than a walk of the log, and that asymmetry with
+-- CleanupRemovedQuestsFallback is deliberate. A collapsed header takes its quests out of the index
+-- space the log walk sees, so a walk cannot find exactly the quests this pass exists to rescue --
+-- while the cache is collapse-proof, because CheckForChanges expands the whole log before reading,
+-- and it is pruned on removal by QuestLogCache.RemoveQuest. The cleanup pass has the opposite need:
+-- the log is the only authority on what is gone, which is why it keeps its walk and refuses to run
+-- on a partial log. One adds from the cache, the other removes from the log, and the sets stay
+-- disjoint.
+function _QuestEventHandler:RegisterMissingQuestsFallback()
+    if not QuestiePlayer.currentQuestlog then return end
+
+    -- When nothing is collapsed the walk is complete, so it can be trusted to veto a cache entry
+    -- for a quest the player no longer has -- a removal that landed while a header was shut leaves
+    -- one behind, because the cleanup pass declines to run then. When the log IS partial there is
+    -- nothing to check against and the cache stands on its own.
+    local stats = QuestEventHandler.reconcileStats
+    local partial = QuestieCompat.IsQuestLogPartial()
+    stats.lastPartial = partial
+
+    local inLog
+    if not partial then
+        inLog = {}
+        local numEntries = select(1, GetNumQuestLogEntries()) or 0
+        for questLogIndex = 1, numEntries do
+            local title, _, _, isHeader, _, _, _, logId = GetQuestLogTitle(questLogIndex)
+            if title and logId and logId > 0 and (not isHeader) then
+                inLog[logId] = true
+            end
+        end
+    end
+
+    local added, cacheCount, vetoed = 0, 0, 0
+    for questId in pairs(QuestLogCache.questLog_DO_NOT_MODIFY or {}) do
+        cacheCount = cacheCount + 1
+        -- Counted separately from "already registered": a cache entry the log walk cannot vouch
+        -- for is the one case where this pass declines to act on the cache, and it is the only
+        -- way a quest that is plainly in the cache can come out of here still unregistered.
+        if type(questId) == "number" and questId > 0
+            and (not QuestiePlayer.currentQuestlog[questId])
+            and inLog and (not inLog[questId]) then
+            vetoed = vetoed + 1
+        end
+        if type(questId) == "number" and questId > 0
+            and (not QuestiePlayer.currentQuestlog[questId])
+            and ((not inLog) or inLog[questId]) then
+            local quest = QuestieDB.GetQuest(questId)
+
+            if quest then
+                QuestiePlayer.currentQuestlog[questId] = quest
+                -- Objectives come from here. Guarded because one quest failing to populate must
+                -- not strand the ones after it -- which is exactly what the login rebuild, an
+                -- unprotected loop over every quest, has no defence against.
+                local ok, err = pcall(function() QuestieQuest:PopulateQuestLogInfo(quest) end)
+                if not ok then
+                    Questie:Debug(Questie.DEBUG_CRITICAL,
+                        "[RegisterMissingQuestsFallback] PopulateQuestLogInfo failed for", questId, err)
+                end
+            else
+                -- No database row and none to build from: register the id on its own, the same
+                -- way the login rebuild does, and the tracker builds an object from the log.
+                QuestiePlayer.currentQuestlog[questId] = questId
+            end
+
+            added = added + 1
+            Questie:Debug(Questie.DEBUG_INFO,
+                "[RegisterMissingQuestsFallback] registering quest the rebuild never took:", questId)
+        end
+    end
+
+    stats.lastCacheCount = cacheCount
+    stats.lastVetoed = vetoed
+    stats.lastAdded = added
+    stats.totalAdded = stats.totalAdded + added
+
+    if added > 0 then
+        QuestieCombatQueue:Queue(function()
+            QuestieTracker:Update()
+        end)
+    end
+
+    return added
 end
 
 --- Does a full scan of the quest log and updates every quest that is in the QUEST_ACCEPTED state and which hash changed

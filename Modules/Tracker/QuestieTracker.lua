@@ -30,6 +30,8 @@ local QuestieTooltips = QuestieLoader:ImportModule("QuestieTooltips")
 local QuestieLib = QuestieLoader:ImportModule("QuestieLib")
 ---@type QuestiePlayer
 local QuestiePlayer = QuestieLoader:ImportModule("QuestiePlayer")
+---@type QuestLogCache
+local QuestLogCache = QuestieLoader:ImportModule("QuestLogCache")
 ---@type QuestieCombatQueue
 local QuestieCombatQueue = QuestieLoader:ImportModule("QuestieCombatQueue")
 ---@type QuestEventHandler
@@ -145,6 +147,40 @@ function QuestieTracker:PruneGhostQuests()
         return false
     end
 
+    -- A collapsed quest log header takes its quests out of the index space GetQuestLogIndexByID
+    -- walks, so every one of them answers "no index" -- which the test below cannot tell apart from
+    -- a quest the player no longer has. Pruning on that reading deletes quests the player is still
+    -- on and takes their tracking state in Questie.db.char with it, which no later pass can put
+    -- back. Collapsing a header in the game's own quest log is what made the tracker drop that
+    -- whole zone group, quests and all, the moment it was shut.
+    --
+    -- The log cannot be expanded from here: this runs on QUEST_LOG_UPDATE and expanding fires one.
+    -- So the shut headers are named instead, and a missing index is only forgiven for a quest that
+    -- actually sits under one of them. Everything else is pruned as before, which matters because
+    -- ghost quests are the whole point of this pass: one closed header must not switch the cleanup
+    -- off for the rest of the log.
+    local collapsedHeaders, collapsedCount = {}, 0
+    if QuestieCompat.GetCollapsedHeaderLookup then
+        collapsedHeaders, collapsedCount = QuestieCompat.GetCollapsedHeaderLookup()
+    end
+
+    -- QuestLogCache records the header each quest sat under, from a walk that could see the whole
+    -- log, and it only ever evicts a quest through RemoveQuest -- which the turn-in and abandon
+    -- events call by id. So a quest that vanished with no event still has its header here.
+    local function absenceExplainedByCollapse(questId)
+        if collapsedCount == 0 then
+            return false
+        end
+        local header = QuestLogCache and QuestLogCache.GetHeader and QuestLogCache.GetHeader(questId)
+        if header then
+            return collapsedHeaders[header] == true
+        end
+        -- No recorded header, so there is nothing to rule the collapse out with. Keeping the quest
+        -- costs a stale tracker line until the player opens that header; pruning it on a guess
+        -- costs the quest and its saved tracking state, and that does not come back.
+        return true
+    end
+
     local removedAny = false
     -- Fix #8: Collect stale keys first, then delete AFTER the pairs() loop to
     -- avoid iterator invalidation (undefined behaviour in all WoW Lua runtimes).
@@ -167,7 +203,7 @@ function QuestieTracker:PruneGhostQuests()
 
         if questId then
             local idx = GetQuestLogIndexByID and GetQuestLogIndexByID(questId)
-            if (not idx) or idx <= 0 then
+            if ((not idx) or idx <= 0) and (not absenceExplainedByCollapse(questId)) then
                 -- Fix #1: Guard the questId before accessing so we never generate
                 -- the "doesn't exist in Game's quest log" warning at all.
                 toRemove[#toRemove + 1] = { key = key, questId = questId, clean = true }
@@ -875,6 +911,8 @@ function QuestieTracker:Update()
 
     -- Begin populating the Tracker with Quests
     local _UpdateQuests = function()
+        -- Cleared per draw, so what is read back afterwards describes this draw and not an old one.
+        QuestieTracker.lastDrawErrors = {}
         for _, questId in pairs(sortedQuestIds) do
             local status, result = pcall(function()
                 if not questId then return "BREAK" end
@@ -1600,6 +1638,12 @@ function QuestieTracker:Update()
             end)
 
             if not status then
+                -- Recorded as well as reported. Questie:Error routes through the debug gate, which
+                -- is off by default, so a quest that throws while being drawn simply disappears
+                -- from the tracker with nothing said about it anywhere -- indistinguishable from a
+                -- quest that was filtered out on purpose. /questie why reads this back.
+                QuestieTracker.lastDrawErrors = QuestieTracker.lastDrawErrors or {}
+                QuestieTracker.lastDrawErrors[questId] = tostring(result)
                 Questie:Error("Tracker Error for quest " .. tostring(questId) .. ": " .. tostring(result))
             elseif result == "BREAK" then
                 break
@@ -2606,13 +2650,17 @@ function QuestieTracker:AQW_Insert(index, expire)
 
         if quest then
             -- Make sure quests or zones (re)added to the tracker isn't in a minimized state
-            local zoneId = quest.zoneOrSort
             if Questie.db.char.collapsedQuests[questId] == true then
                 Questie.db.char.collapsedQuests[questId] = nil
             end
 
-            if Questie.db.char.collapsedZones[zoneId] == true then
-                Questie.db.char.collapsedZones[zoneId] = nil
+            -- collapsedZones is keyed by the zone NAME the draw groups under, so the name has to be
+            -- resolved the same way the draw resolves it. This used to index the table with
+            -- quest.zoneOrSort, a number, which could never match a key -- so re-tracking a quest
+            -- into a collapsed zone left it invisible, which is the exact case this exists to fix.
+            local zoneName = TrackerUtils:GetZoneNameForQuest(quest, questId)
+            if zoneName and Questie.db.char.collapsedZones[zoneName] == true then
+                Questie.db.char.collapsedZones[zoneName] = nil
             end
 
             -- Unhide quest icons when retracking quests.

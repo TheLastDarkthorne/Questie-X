@@ -56,6 +56,7 @@ function QuestieOptionsDefaults:Load()
             questObjectiveColors = false,
             questMinimapObjectiveColors = false,
             arrowEnabled = true,
+            arrowHideInInstances = true,
             arrowScale = 1,
             arrowAlpha = 1.0,
             arrowObjectiveAlpha = 1.0,

@@ -151,23 +151,33 @@ end
 -- For profiling
 QuestLogCache._GetNewObjectives = GetNewObjectives
 
---- Updates questlogcache.
---- Remember to handle returned changes table even when cacheMiss == true. Returned changes are still valid. There may just be more changes that we couldn't get yet.
---- Called only from QuestEventHandler.
----@param questIdsToCheck table? @keys are the questIds
----@return boolean cacheMiss, table changes @cacheMiss = couldn't get all required data  ; changes[questId] = list of changed objectiveIndexes (may be an empty list if quest has no objectives)
-function QuestLogCache.CheckForChanges(questIdsToCheck)
+-- Reads the quest log as it stands. Call through QuestLogCache.CheckForChanges, which makes sure
+-- the whole log is walkable first.
+local function CheckForChanges(questIdsToCheck)
     local cacheMiss = false
     local changes = {}
     local questIdsChecked = {}
 
-    local numEntries = select(1, GetNumQuestLogEntries()) or 0
+    local numEntries, numQuests = GetNumQuestLogEntries()
+    numEntries = numEntries or 0
+    -- The header a quest sits under is only knowable from its position in this walk, and the
+    -- tracker needs it to group quests the database has never heard of. Recording it here means
+    -- the tracker still has it for a quest that a later, partial walk cannot reach.
+    local header
+    -- How many quests this walk could actually reach, checked against the client's own total below.
+    local questsSeen = 0
+
     for questLogIndex = 1, numEntries do
         local title, level, questTag, isHeader, isCollapsed, isComplete, isDaily, questId = GetQuestLogTitle(
         questLogIndex)
 
+        if isHeader then
+            if title and title ~= "" then
+                header = title
+            end
         -- Skip weird/header entries / questId=0 (these happen a lot on your server)
-        if title and questId and questId > 0 and (not isHeader) then
+        elseif title and questId and questId > 0 then
+            questsSeen = questsSeen + 1
             if (not questIdsToCheck) or questIdsToCheck[questId] then
                 questIdsChecked[questId] = true
 
@@ -178,7 +188,17 @@ function QuestLogCache.CheckForChanges(questIdsToCheck)
                     local newObjectives, changedObjIds = GetNewObjectives(questId, cachedObjectives, questLogIndex)
 
                     if newObjectives then
-                        if (not cachedQuest) or (table.getn(cachedObjectives) == table.getn(newObjectives) and table.getn(cachedObjectives) > 0 and
+                        -- Quest-level state (title / tag / isComplete) can change without any
+                        -- objective line changing. The equal-count guard stops a transiently
+                        -- empty leaderboard from wiping a populated cache entry, but it must NOT
+                        -- also require a non-empty list: a pure exploration quest (questKeys.
+                        -- triggerEnd, e.g. "Investigating the Camp") has no countable leaderboard
+                        -- line at all, so GetNewObjectives can never report a change for it. With
+                        -- a "> 0" clause here its cache entry was written once and then frozen,
+                        -- leaving isComplete stuck at 0 for the session -- which kept
+                        -- QuestieDB.IsComplete returning 0 and pinned the arrow to the explored
+                        -- spot forever.
+                        if (not cachedQuest) or (table.getn(cachedObjectives) == table.getn(newObjectives) and
                                 (cachedQuest.title ~= title or cachedQuest.questTag ~= questTag or cachedQuest.isComplete ~= isComplete)) then
                             changedObjIds = {}
                             for i = 1, table.getn(newObjectives) do
@@ -204,8 +224,16 @@ function QuestLogCache.CheckForChanges(questIdsToCheck)
                                 questTag = questTag,
                                 isComplete = isComplete,
                                 objectives = newObjectives,
+                                header = header,
                             }
                             changes[questId] = changedObjIds
+                        end
+
+                        -- Also on the unchanged path: a quest whose objectives never move still
+                        -- gets refiled when the server changes its category, and the entry is
+                        -- only rewritten above when something changed.
+                        if cache[questId] and header then
+                            cache[questId].header = header
                         end
                     else
                         cacheMiss = true
@@ -219,6 +247,23 @@ function QuestLogCache.CheckForChanges(questIdsToCheck)
                 end
             end
         end
+    end
+
+    -- A quest the walk could not reach at all is a cache miss too, and it is a different kind from
+    -- the one above: that one means "this quest's objective text has not arrived yet", which only
+    -- gets noticed for a quest that was visible in the first place. A quest hidden behind a
+    -- collapsed header is not visible, so nothing was ever recorded as missing for it -- the login
+    -- read then looked complete, InitQuestLog never retried, and the rebuild it does on a retry
+    -- never happened. currentQuestlog was left short of the log for the rest of the session.
+    --
+    -- GetNumQuestLogEntries' second return counts every quest the log holds, collapsed or not (it
+    -- is what the "Quests: n/25" counter shows), so a walk that came up short read a partial log.
+    -- Only used to ask for a retry, never to discard anything, so a client that reports this
+    -- oddly costs a few extra login passes and nothing else.
+    if type(numQuests) == "number" and numQuests > 0 and questsSeen < numQuests then
+        Questie:Debug(Questie.DEBUG_INFO, "[QuestLogCache.CheckForChanges] Only reached", questsSeen,
+            "of", numQuests, "quests -- treating as a cache miss so the log is read again")
+        cacheMiss = true
     end
 
     -- Debug / warning: ignore questId=0 and don't treat it as "missing" when the log has weird entries
@@ -235,6 +280,30 @@ function QuestLogCache.CheckForChanges(questIdsToCheck)
     return cacheMiss, changes
 end
 
+--- Updates questlogcache.
+--- Remember to handle returned changes table even when cacheMiss == true. Returned changes are still valid. There may just be more changes that we couldn't get yet.
+--- Called only from QuestEventHandler.
+---@param questIdsToCheck table? @keys are the questIds
+---@param forceFullLog boolean? @bypass the expand throttle; for the login read
+---@return boolean cacheMiss, table changes @cacheMiss = couldn't get all required data  ; changes[questId] = list of changed objectiveIndexes (may be an empty list if quest has no objectives)
+function QuestLogCache.CheckForChanges(questIdsToCheck, forceFullLog)
+    -- A collapsed header hides its quests from the walk below, and this is the only thing that
+    -- puts a quest into the cache -- so without expanding first, a quest the player accepted
+    -- under a shut header is never cached, never reaches currentQuestlog, and never draws.
+    return QuestieCompat.WithFullQuestLog(function()
+        return CheckForChanges(questIdsToCheck)
+    end, forceFullLog)
+end
+
+--- The quest log header the client filed a quest under, as of the last walk that could see it.
+--- Survives the quest being hidden behind a collapsed header, which the live log cannot report.
+---@param questId QuestId
+---@return string?
+function QuestLogCache.GetHeader(questId)
+    local entry = cache[questId]
+    return entry and entry.header
+end
+
 function QuestLogCache.RemoveQuest(questId)
     Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestLogCache.RemoveQuest] remove questId:", questId)
     cache[questId] = nil
@@ -248,7 +317,7 @@ end
 --- Tests if game client's cache has all quest log quests and objectives cached.
 --- Avoid using this function if possible.
 ---@return boolean gameCacheOK
-function QuestLogCache.TestGameCache()
+local function TestGameCache()
     local gameCacheOK = true
     for questLogIndex = 1, MAX_QUEST_LOG_INDEX do
         local title, level, questTag, isHeader, isCollapsed, isComplete, isDaily, questId = GetQuestLogTitle(
@@ -273,6 +342,15 @@ function QuestLogCache.TestGameCache()
     Questie:Debug(Questie.DEBUG_DEVELOP, "[QuestLogCache.TestGameCache]",
         (gameCacheOK and "Cache ok." or "Cache missing data."))
     return gameCacheOK
+end
+
+--- Tests if game client's cache has all quest log quests and objectives cached.
+--- Avoid using this function if possible.
+---@return boolean gameCacheOK
+function QuestLogCache.TestGameCache()
+    -- Expanded first, or a quest behind a shut header is reported as cached simply by being
+    -- invisible to the walk.
+    return QuestieCompat.WithFullQuestLog(TestGameCache)
 end
 
 --- A wrapper function to add error check instead using exposed table directly.

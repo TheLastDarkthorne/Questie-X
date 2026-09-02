@@ -18,9 +18,19 @@ local _Learner = QuestieLearner.private or {}
 
 local GetDataSourceMode
 local DeepCopy
-local HasQuestNpcReferences
 local HasQuestNpcGiverReferences
 local HasQuestObjectGiverReferences
+
+-- Forward declarations. RefreshLiveState() calls these before their definitions
+-- appear further down the file. Without declaring them here they compile as reads
+-- of nil GLOBALS: _FlushNpcLiveUpdates() then raises "attempt to call a nil value"
+-- whenever an option changes inside the NPC debounce window, and the
+-- _pendingQuestPinRefreshes guard silently never fires, so RefreshLiveState never
+-- force-flushes pending pins -- its whole purpose.
+-- To check: luac -l Modules/QuestieLearner.lua | grep _ENV should list none of these.
+local _pendingQuestPinRefreshes
+local _FlushActiveQuestPins
+local _FlushNpcLiveUpdates
 
 local floor = math.floor
 local abs   = math.abs
@@ -67,9 +77,6 @@ if not string_trim then
         return string.sub(text, startPos, endPos)
     end
 end
-local string_sub = string.sub
-local string_len = string.len
-local string_upper = string.upper
 local AceConfigRegistry = LibStub and LibStub("AceConfigRegistry-3.0", true)
 
 local function IsAscensionProtected(dbType, id, key)
@@ -158,6 +165,26 @@ local function CopyTable(dst, src)
     end
 end
 
+-- uiMapId 946 is the "Cosmic" root map: mapType 0, mapID -1, and all four bounds
+-- zero (Compat/UiMapData.lua). QuestieCompat.GetCurrentUiMapID() returns it as its
+-- LAST-RESORT fallback when the map lookup chain falls through -- its own comment
+-- calls this "the ghost-map path" that "breaks redraws". It means "I could not work
+-- out where you are", not a place.
+--
+-- The learner used to store kill coordinates under it anyway. Because the map has no
+-- coordinate space, those pins can never render: in one real profile 79 of 251 NPCs
+-- with spawn data (31%) had ALL their coordinates stranded there, every one of them a
+-- dungeon mob (Blood Furnace, Auchenai Crypts, Underbog) -- the lookup falls through
+-- reliably inside instances.
+--
+-- Names, levels, and quest links are still worth learning in that state; only the
+-- coordinates are meaningless, so this gates spawn storage alone.
+local GHOST_MAP_ID = 946
+
+local function IsUsableSpawnZone(zoneKey)
+    return type(zoneKey) == "number" and zoneKey > 0 and zoneKey ~= GHOST_MAP_ID
+end
+
 local function NormalizeSpawnZoneKey(zoneKey)
     -- Convert raw area IDs (e.g. 3431 from GetAreaID()) to the canonical map IDs
     -- used by AscensionDB and the rendering system (e.g. 1241 for Sunstrider Isle).
@@ -173,6 +200,51 @@ local function NormalizeSpawnZoneKey(zoneKey)
         if mapped then return mapped end
     end
     return zoneKey
+end
+
+-- Recover a real zone key when the map layer handed us the ghost map.
+--
+-- Inside a dungeon this is not an edge case, it is the norm: Compat/UiMapData.lua has
+-- no entry for any instance (55 maps, none of them 3713 Blood Furnace, 3790 Auchenai
+-- Crypts, ...), so GetCurrentUiMapID() cannot resolve one and returns 946 every time.
+-- The COORDINATES it returns alongside are still the real interior position -- the
+-- client does have dungeon maps, so GetPlayerMapPosition is valid; only the map
+-- IDENTITY is lost. Throwing those away would discard genuine spawn points.
+--
+-- GetCurrentMapAreaID() still reports the dungeon's areaId, and ZoneDB maps it to a
+-- usable key (zoneTables.lua: [3713] = 261 The Blood Furnace). NormalizeSpawnZoneKey
+-- goes through that same table, so recovered keys land in the same space as every
+-- other learner spawn.
+local function RecoverGhostMapZone()
+    local areaId = GetCurrentMapAreaID and GetCurrentMapAreaID()
+    if areaId and areaId > 0 then
+        local recovered = NormalizeSpawnZoneKey(areaId)
+        if IsUsableSpawnZone(recovered) then
+            return recovered
+        end
+    end
+
+    -- Deliberately NO GetInstanceInfo fallback. Its instanceMapID lives in a different
+    -- id space that overlaps areaIds, so normalizing one silently lands on an unrelated
+    -- zone: instanceMapID 33 (Shadowfang Keep) -> areaId 33 -> uiMapId 1434 Stranglethorn
+    -- Vale; 36 (Deadmines) -> Alterac Mountains; 47 (Razorfen Kraul) -> The Hinterlands.
+    -- That would draw confidently wrong pins in an outdoor zone AND let
+    -- QuestieDB.GetSuppressedNPCs hide the real static spawns there. A missing
+    -- coordinate is much cheaper than a wrong one.
+    --
+    -- Instance placement is best-effort by design. Custom servers reskin dungeons,
+    -- add difficulty tiers with fresh creature ids, and ship instances the static map
+    -- data has never heard of, so there is often no honest key to store. Leaving those
+    -- mobs without coordinates is the correct outcome -- the NPC is still learned, and
+    -- its name, level and quest links still work.
+    return nil
+end
+
+-- Returns a storable zone key, recovering from the ghost map where possible.
+local function ResolveSpawnZone(zoneId)
+    if IsUsableSpawnZone(zoneId) then return zoneId end
+    if zoneId == GHOST_MAP_ID then return RecoverGhostMapZone() end
+    return nil
 end
 
 local function IsSunstriderNativeZone(zoneKey)
@@ -192,12 +264,19 @@ local UnitCreatureFamily = UnitCreatureFamily
 local UnitCreatureType = UnitCreatureType
 local GetRealZoneText = GetRealZoneText
 local GetTitleText = GetTitleText
-local GetObjectiveText = GetObjectiveText
-local GetQuestDescription = GetQuestDescription
 local GetRewardText = GetRewardText
-local GetQuestID = GetQuestID
+-- GetQuestID is NOT a 3.3.5a API (added in Cataclysm) -- it appears nowhere in the
+-- 3.3.5 FrameXML, and Compat/Compat.lua ships QuestieCompat.GetQuestID precisely
+-- because of that. Capturing the raw global here bound it to nil at load time, so
+-- OnQuestDetail and OnQuestComplete both returned on their first line and never
+-- learned a single quest giver. Every other consumer already uses the compat
+-- version -- see Modules/Auto/QuestieAuto.lua:10, which handles the same events.
+local GetQuestID = QuestieCompat.GetQuestID
 local GetNumQuestLogEntries = GetNumQuestLogEntries
-local GetItemInfo = GetItemInfo
+-- 3.3.5a GetItemInfo returns 11 values, with no classID/subclassID (those arrived in
+-- 7.0.3). QuestieCompat.GetItemInfo appends a 12th derived class id, so callers that
+-- want item class must go through it rather than the raw global.
+local GetItemInfo = QuestieCompat.GetItemInfo
 local CombatLogGetCurrentEventInfo = CombatLogGetCurrentEventInfo
 local CreateFrame = CreateFrame
 local GetTime = GetTime
@@ -216,9 +295,6 @@ local NPC_FLAG_BANKER          = 0x00001000
 local NPC_FLAG_AUCTIONEER      = 0x00004000
 local NPC_FLAG_STABLEMASTER    = 0x00010000
 
--- Only cache/learn mouseover NPCs that carry one of these flags
-local MOUSEOVER_LEARN_FLAGS = NPC_FLAG_QUESTGIVER
-
 -- Coordinate grid cell size (in 0–100 map units).
 -- ~2 grid units ≈ 2% of zone width — keeps clusters tight without over-splitting.
 local COORD_GRID = 2.0
@@ -228,13 +304,25 @@ local COORD_GRID = 2.0
 -- Ascension, where NPC databases are incomplete and every data point matters.
 local MIN_CONFIDENCE_PINS = 1
 
+-- Small interior maps where the default 2% bucket is too coarse and would collapse
+-- genuinely distinct spawn points into a single pin. Keyed by the same zone key the
+-- spawn is stored under (NormalizeSpawnZoneKey output), so this is safe to consult
+-- from any code path -- unlike the old GetCustomGridPrecision(), which derived the
+-- grid from wherever the PLAYER was standing and so used the wrong precision for
+-- migrations and for coordinates merged in from other players.
+local FINE_GRID_ZONES = {
+    [425] = 0.5, -- Northshire Abbey
+    [468] = 0.5, -- Anvilmar
+    [469] = 0.5, -- Coldridge Valley (interior)
+}
+
 local function GetCoordGridForZone(zoneId)
     -- Sunstrider's starter mobs are packed tightly; a 2% bucket collapses
     -- distinct spawn points such as 58.68/43.19 and 59.11/44.00 into one pin.
     if IsSunstriderNativeZone(zoneId) then
         return 0.5
     end
-    return COORD_GRID
+    return FINE_GRID_ZONES[zoneId] or COORD_GRID
 end
 
 _Learner.pendingNpcs    = {}
@@ -284,9 +372,13 @@ local function GetZoneId()
         end
         return uiMapId  -- fallback: no ZoneDB mapping available
     end
-    -- Lua 5.0 compat: replace select(8, GetInstanceInfo()) with explicit GetInstanceInfo unpack
-    local _, _, _, _, _, _, _, instanceMapID = GetInstanceInfo()
-    return instanceMapID or 0
+    -- No usable zone. Do NOT fall back to GetInstanceInfo's instanceMapID: it is a
+    -- different id space that overlaps areaIds, so callers normalizing it land on an
+    -- unrelated zone -- instanceMapID 33 (Shadowfang Keep) normalizes to uiMapId 1434
+    -- Stranglethorn Vale, 36 (Deadmines) to Alterac Mountains, 47 (Razorfen Kraul) to
+    -- The Hinterlands. Returning 0 lets callers treat the zone as unknown, which every
+    -- one of them already handles.
+    return 0
 end
 
 local function GetPlayerCoords()
@@ -379,11 +471,6 @@ local function RestoreStaticOverridesForMode()
     CopyTable(QuestieDB.objectDataOverrides, snapshot.objects)
 end
 
--- Returns the grid-bucket key for a coordinate so nearby points share the same slot
-local function CoordBucket(x, y)
-    return floor(x / COORD_GRID) * COORD_GRID, floor(y / COORD_GRID) * COORD_GRID
-end
-
 -- Inserts {x, y} into coordList only when no existing point falls in the same grid bucket.
 -- If a point already exists in that bucket, gently heal it toward the new evidence
 -- using a weighted average so repeated kills converge instead of duplicating pins.
@@ -411,48 +498,6 @@ local function InsertIfNewBucket(coordList, x, y, customGrid)
     end
     table.insert(coordList, {x, y, 1})
     return true
-end
-
-local function CountUniqueSpawnPositions(spawns)
-    if type(spawns) ~= "table" then return 0 end
-
-    local seen = {}
-    local count = 0
-    for _, coords in pairs(spawns) do
-        if type(coords) == "table" then
-            for _, coord in ipairs(coords) do
-                local x, y = NormalizeCoordPair(coord[1], coord[2])
-                if x and y then
-                    local key = tostring(x) .. "," .. tostring(y)
-                    if not seen[key] then
-                        seen[key] = true
-                        count = count + 1
-                    end
-                end
-            end
-        end
-    end
-
-    return count
-end
-
--- Detects if the current map is a "Micro-Dungeon" (small interior map)
--- This is a heuristic: if we lack map data, we default to standard grid.
-local function GetCustomGridPrecision()
-    local uiMapId = C_Map and C_Map.GetBestMapForUnit and C_Map.GetBestMapForUnit("player")
-    if not uiMapId then return COORD_GRID end
-
-    -- Known micro-dungeons or small interior maps where 2% precision is too coarse.
-    -- (e.g., Northshire Abbey, Anvilmar, Crypts, etc.)
-    -- For now, we use a simple list of common starting sub-zones if available.
-    -- Or we could check map bounds if we had that data.
-    local microDungeons = {
-        [425] = 0.5, -- Northshire Abbey
-        [468] = 0.5, -- Anvilmar
-        [469] = 0.5, -- Coldridge Valley (Interior)
-        -- Add more as needed
-    }
-    return microDungeons[uiMapId] or COORD_GRID
 end
 
 ------------------------------------------------------------------------
@@ -550,6 +595,28 @@ local function EnsureLearnedData()
             s.learnerCommsIntensity = "normal"
         end
     end
+
+    -- One-time repair. OnQuestComplete used to write GetRewardText() into key 18, which the quest
+    -- schema declares as requiredSkill = {skill(int), value(int)}. Records written by those builds
+    -- carry a string where consumers expect a table, and they persist in saved variables until
+    -- something clears them. Only a string is stripped, so a genuine requiredSkill table survives.
+    local quests = Questie.dbLearner.global.quests
+    if quests and not Questie.dbLearner.global.rewardTextKeyRepaired then
+        local repaired = 0
+        for _, record in pairs(quests) do
+            if type(record) == "table" and type(record[18]) == "string" then
+                record.rewardText = record.rewardText or record[18]
+                record[18] = nil
+                repaired = repaired + 1
+            end
+        end
+        Questie.dbLearner.global.rewardTextKeyRepaired = true
+        if repaired > 0 then
+            Questie:Debug(Questie.DEBUG_INFO,
+                "[QuestieLearner] Moved reward text off the requiredSkill key on", repaired, "record(s)")
+        end
+    end
+
     return true
 end
 
@@ -717,7 +784,7 @@ local function _GetDB() return Questie.dbLearner.global end
 -- Triggers QuestieQuest:UpdateQuest for every active quest in the player's log
 -- that is referenced in the provided set (table with questId keys).
 -- Called after cross-linking so map pins refresh immediately.
-local _pendingQuestPinRefreshes = {}
+_pendingQuestPinRefreshes = {}
 local _pendingQuestPinRefreshTimer = nil
 local _pendingQuestPinFirstDirty = nil      -- GetTime() of first pending change since last flush
 local _pendingQuestPinLastActivity = nil    -- GetTime() of most recent queued change
@@ -759,7 +826,7 @@ local function _DoFlushActiveQuestPins()
     _pendingQuestFrameUnloads = {}
 end
 
-local function _FlushActiveQuestPins()
+_FlushActiveQuestPins = function()
     -- Only defer while there is genuine pending activity. If the timestamps were
     -- already cleared (e.g. the NPC live-update flush force-flushed the pins via
     -- _DoFlushActiveQuestPins), a leftover timer must NOT treat the nil timestamp
@@ -1048,7 +1115,7 @@ end
 
 -- Trailing-debounce gate, mirroring _FlushActiveQuestPins. liveNpcUpdateDelay is
 -- the quiet window; pinRefreshMaxWait is the shared worst-case cap (0 = never force).
-local function _FlushNpcLiveUpdates()
+_FlushNpcLiveUpdates = function()
     local timer = QuestieCompat and QuestieCompat.C_Timer
     local now = (GetTime and GetTime()) or 0
     local delay = GetLearnerSetting("liveNpcUpdateDelay", 0.75)
@@ -1128,6 +1195,17 @@ local function _RebuildNpcNameIndex()
         end
     end
 
+    -- KNOWN LIMITATION: QuestieCleanup:Run() (QuestieInit.lua:360) nils
+    -- QuestieDB.npcData during init, so on a normal login this loop contributes
+    -- nothing and baseIndex stays empty -- GetNPCIdByName then only resolves names
+    -- the learner itself has recorded, never static-DB NPCs.
+    --
+    -- Rebuilding it from QuestieDB.NPCPointers would mean ~30k QueryNPCSingle stream
+    -- reads; that may be fine as a one-off lazy build, but it has not been measured on
+    -- a real client and an unmeasured multi-second hitch here would be worse than the
+    -- degraded fallback. Callers already try id-based resolution first
+    -- (OnQuestAccepted uses quest.ObjectiveData[j].IdList), so this is a fallback
+    -- losing reach, not a hard failure. Left as-is deliberately; measure before changing.
     if QuestieDB and QuestieDB.npcData then
         for npcId, data in pairs(QuestieDB.npcData) do
             local name = data and data[1]
@@ -1138,6 +1216,10 @@ local function _RebuildNpcNameIndex()
                 end
             end
         end
+    elseif Questie and Questie.Debug then
+        Questie:Debug(Questie.DEBUG_INFO,
+            "[QuestieLearner] NPC name index: static DB unavailable (npcData cleaned up);",
+            "name lookups resolve learner data only")
     end
 
     _Learner.npcNameIndex = {
@@ -1516,7 +1598,7 @@ function QuestieLearner:LearnNPC(npcId, name, level, subName, npcFlags, factionS
     -- Use provided spawn coords (e.g. from kill event) or fall back to current player position.
     -- Normalize area IDs → map IDs immediately so all storage uses the same key space
     -- as AscensionDB (e.g. 3431 → 1241, 3430 → 1941).
-    local zoneId = NormalizeSpawnZoneKey(spawnZoneId or GetZoneId())
+    local zoneId = ResolveSpawnZone(NormalizeSpawnZoneKey(spawnZoneId or GetZoneId()))
     local x, y
     if spawnX and spawnY then
         x, y = spawnX, spawnY
@@ -1539,10 +1621,10 @@ function QuestieLearner:LearnNPC(npcId, name, level, subName, npcFlags, factionS
         if not existing[4] or level < existing[4] then existing[4] = level end
         if not existing[5] or level > existing[5] then existing[5] = level end
     end
-    if zoneId        and zoneId > 0 and not existing[9]  then existing[9]  = zoneId end
+    if IsUsableSpawnZone(zoneId) and not existing[9]  then existing[9]  = zoneId end
     if factionString and not existing[13] then existing[13] = factionString end
     if subName       and not existing[14] then existing[14] = subName end
-    if x and y and zoneId and zoneId > 0 then
+    if x and y and IsUsableSpawnZone(zoneId) then
         existing[7] = existing[7] or {}
         existing[7][zoneId] = existing[7][zoneId] or {}
         InsertIfNewBucket(existing[7][zoneId], x, y, GetCoordGridForZone(zoneId))
@@ -1633,13 +1715,15 @@ function QuestieLearner:_StoreGuidSpawnEvidence(npcId, dstGUID, zoneId, x, y)
     if not self:IsEnabled() then return end
     if not npcId or npcId <= 0 then return end
     if not dstGUID or type(dstGUID) ~= "string" then return end
-    if not zoneId or zoneId <= 0 then return end
     if not x or not y or x <= 0 or y <= 0 then return end
 
     -- Normalize area IDs → map IDs so evidence is keyed identically to AscensionDB.
     -- Without this, kills on Sunstrider store under zone 3431 (area ID) while the
     -- renderer expects zone 1241 (map ID), causing pins to silently not appear.
-    zoneId = NormalizeSpawnZoneKey(zoneId)
+    -- Normalize BEFORE the usability check so ResolveSpawnZone sees the same key space
+    -- the store uses, and can recover a dungeon key instead of the ghost map.
+    zoneId = ResolveSpawnZone(NormalizeSpawnZoneKey(zoneId))
+    if not IsUsableSpawnZone(zoneId) then return end
 
     local spawnUID = _ExtractSpawnUID(dstGUID)
     if not spawnUID then return end
@@ -1961,12 +2045,22 @@ end
 -- Quest learning
 ------------------------------------------------------------------------
 
--- Captures all fields accessible from the WoW API.
--- Quest data array indices follow the Questie wiki spec exactly:
---  [1]  name           [2]  starters (npc/obj/item arrays)  [3]  finishers
---  [4]  requiredLevel  [5]  questLevel  [6]  infoText (objectives text block)
---  [7]  requiredMoney  [8]  zoneOrSort  [12] requiredRaces   [13] requiredClasses
---  [17] details text   [18] finishText  [19] completedText
+-- The fields the client's own quest log is authoritative for, and which a later sighting may
+-- therefore overwrite. Deliberately just these two: every other key is either derived, inferred
+-- from surroundings, or accumulated across sightings, and letting those be rewritten would undo
+-- the protection first-write-wins is there to give.
+local REFRESHABLE_QUEST_KEYS = {
+    [QuestieDB.questKeys.name] = true,
+    [QuestieDB.questKeys.questLevel] = true,
+}
+
+-- Captures fields accessible from the WoW API, keyed by QuestieDB.questKeys. That table in
+-- Database/questDB.lua is the only authority on the indices -- the list that used to sit here named
+-- [6] infoText, [7] requiredMoney, [8] zoneOrSort, [17] details, [18] finishText and [19]
+-- completedText, none of which match the schema, and one of those wrong indices was being written.
+-- The ones this module actually uses: [1] name, [5] questLevel, [10] objectives, [17] zoneOrSort.
+-- Anything with no slot in the schema, such as reward text, goes on a named key instead of a
+-- numeric one so the database adapter ignores it.
 function QuestieLearner:LearnQuest(questId, data)
     if not self:IsEnabled() then
         Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] LearnQuest blocked: learner not enabled")
@@ -1990,8 +2084,19 @@ function QuestieLearner:LearnQuest(questId, data)
     existing.ls = time() -- Update last seen
 
     for k, v in pairs(data) do
-        if v ~= nil and v ~= "" and v ~= 0 and existing[k] == nil then
-            existing[k] = v
+        if v ~= nil and v ~= "" and v ~= 0 then
+            if existing[k] == nil then
+                existing[k] = v
+            elseif REFRESHABLE_QUEST_KEYS[k] and existing[k] ~= v then
+                -- First-write-wins everywhere else, because it is what stops a momentary bad
+                -- reading from sticking. These two are the exception: they come straight off the
+                -- client's quest log, which is authoritative for them, so a later sighting is at
+                -- least as good as the first -- and without this a name or level captured wrongly
+                -- once, or captured while a collapsed header hid the row, could never be repaired.
+                Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] Refreshing learned quest", questId,
+                    "key", k, "from", tostring(existing[k]), "to", tostring(v))
+                existing[k] = v
+            end
         end
     end
 
@@ -2249,13 +2354,28 @@ end
 -- Item learning
 ------------------------------------------------------------------------
 
-local function IsQuestRelevantItem(itemId, itemClass)
+-- itemClass here is QuestieCompat.GetItemInfo's 12th return, which it derives by
+-- numbering GetAuctionItemClasses() 1..n. That list only covers AUCTIONABLE classes
+-- (11 of them on 3.3.5), so it can never yield 12 (QuestieDB.itemClasses.QUEST) and
+-- the old 'itemClass == 12' shortcut below was unreachable -- quest items were only
+-- ever learned once some other quest already referenced them, which defeated the
+-- point of the shortcut.
+--
+-- Inverting the test is what works on this client: a resolved itemType that is NOT in
+-- the auction class map is a non-auctionable class, which on 3.3.5 means Quest or Key.
+-- Both are worth learning. This deliberately errs toward learning a few Key items
+-- rather than continuing to learn no quest items at all.
+local function IsQuestRelevantItem(itemId, itemClass, itemType)
     local learned = Questie and Questie.dbLearner and Questie.dbLearner.global
     if not learned or not learned.quests then
         return false
     end
 
     if itemClass == 12 then
+        return true
+    end
+
+    if itemClass == nil and type(itemType) == "string" and itemType ~= "" then
         return true
     end
 
@@ -2420,48 +2540,12 @@ HasQuestObjectGiverReferences = function(objectId)
     return false
 end
 
-HasQuestNpcReferences = function(npcId)
-    local learned = Questie and Questie.dbLearner and Questie.dbLearner.global
-    if not learned or not learned.quests then
-        return false
-    end
-
-    for _, qData in pairs(learned.quests) do
-        if qData[2] and qData[2][1] then
-            for _, entry in ipairs(qData[2][1]) do
-                local entryId = type(entry) == "table" and entry[1] or entry
-                if entryId == npcId then
-                    return true
-                end
-            end
-        end
-        if qData[3] and qData[3][1] then
-            for _, entry in ipairs(qData[3][1]) do
-                local entryId = type(entry) == "table" and entry[1] or entry
-                if entryId == npcId then
-                    return true
-                end
-            end
-        end
-        if qData[10] and qData[10][1] then
-            for _, entry in ipairs(qData[10][1]) do
-                local entryId = type(entry) == "table" and entry[1] or entry
-                if entryId == npcId then
-                    return true
-                end
-            end
-        end
-    end
-
-    return false
-end
-
-function QuestieLearner:LearnItem(itemId, name, itemLevel, requiredLevel, itemClass, itemSubClass)
+function QuestieLearner:LearnItem(itemId, name, itemLevel, requiredLevel, itemClass, itemSubClass, itemType)
     if not self:IsEnabled() then return end
     if not Questie.dbLearner.global.settings.learnItems then return end
     itemId = tonumber(itemId)
     if not itemId or itemId <= 0 then return end
-    if not IsQuestRelevantItem(itemId, itemClass) then
+    if not IsQuestRelevantItem(itemId, itemClass, itemType) then
         return false
     end
 
@@ -2472,7 +2556,9 @@ function QuestieLearner:LearnItem(itemId, name, itemLevel, requiredLevel, itemCl
         Questie.dbLearner.global.items[itemId] = existing
     end
 
-    if itemClass == 12 or HasQuestReferences(itemId) then
+    -- Reuse the same test as the entry gate above so questRelevant is not stranded
+    -- false for items admitted via the non-auctionable-class path.
+    if IsQuestRelevantItem(itemId, itemClass, itemType) then
         existing.questRelevant = true
     end
 
@@ -2560,7 +2646,7 @@ function QuestieLearner:LearnObject(objectId, name, spawnX, spawnY, spawnZoneId,
         return false
     end
 
-    local zoneId = NormalizeSpawnZoneKey(spawnZoneId or GetZoneId())
+    local zoneId = ResolveSpawnZone(NormalizeSpawnZoneKey(spawnZoneId or GetZoneId()))
     local x, y   = spawnX, spawnY
     if not x or not y then
         x, y = GetPlayerCoords()
@@ -2576,12 +2662,12 @@ function QuestieLearner:LearnObject(objectId, name, spawnX, spawnY, spawnZoneId,
     existing.questRelevant = true
 
     if name   and not existing[1] then existing[1] = name end
-    if zoneId and zoneId > 0 and not existing[5] then existing[5] = zoneId end
+    if IsUsableSpawnZone(zoneId) and not existing[5] then existing[5] = zoneId end
 
-    if x and y and zoneId and zoneId > 0 then
+    if x and y and IsUsableSpawnZone(zoneId) then
         existing[4] = existing[4] or {}
         existing[4][zoneId] = existing[4][zoneId] or {}
-        InsertIfNewBucket(existing[4][zoneId], x, y)
+        InsertIfNewBucket(existing[4][zoneId], x, y, GetCoordGridForZone(zoneId))
     end
  
     existing.ls = time() -- Update last seen
@@ -2612,7 +2698,7 @@ function QuestieLearner:LearnObject(objectId, name, spawnX, spawnY, spawnZoneId,
                 for zid, coords in pairs(existing[4]) do
                     ovr[4][zid] = ovr[4][zid] or {}
                     for _, coord in ipairs(coords) do
-                        InsertIfNewBucket(ovr[4][zid], coord[1], coord[2])
+                        InsertIfNewBucket(ovr[4][zid], coord[1], coord[2], GetCoordGridForZone(zid))
                     end
                 end
             end
@@ -2719,7 +2805,7 @@ function QuestieLearner:InjectLearnedData()
                 for zoneId, coords in pairs(data[4]) do
                     data[7][zoneId] = data[7][zoneId] or {}
                     for _, coord in ipairs(coords) do
-                        InsertIfNewBucket(data[7][zoneId], coord[1], coord[2])
+                        InsertIfNewBucket(data[7][zoneId], coord[1], coord[2], GetCoordGridForZone(zoneId))
                     end
                 end
             end
@@ -2749,7 +2835,7 @@ function QuestieLearner:InjectLearnedData()
                     for zoneId, coords in pairs(charSpawns) do
                         globalSpawns[zoneId] = globalSpawns[zoneId] or {}
                         for _, coord in ipairs(coords) do
-                            InsertIfNewBucket(globalSpawns[zoneId], coord[1], coord[2])
+                            InsertIfNewBucket(globalSpawns[zoneId], coord[1], coord[2], GetCoordGridForZone(zoneId))
                         end
                     end
                 end
@@ -2824,7 +2910,7 @@ function QuestieLearner:InjectLearnedData()
                 if coords then
                     data[7][newKey] = data[7][newKey] or {}
                     for _, coord in ipairs(coords) do
-                        InsertIfNewBucket(data[7][newKey], coord[1], coord[2])
+                        InsertIfNewBucket(data[7][newKey], coord[1], coord[2], GetCoordGridForZone(newKey))
                     end
                     data[7][oldKey] = nil
                     zonesFixed = zonesFixed + 1
@@ -2853,7 +2939,7 @@ function QuestieLearner:InjectLearnedData()
                 if coords then
                     data[4][newKey] = data[4][newKey] or {}
                     for _, coord in ipairs(coords) do
-                        InsertIfNewBucket(data[4][newKey], coord[1], coord[2])
+                        InsertIfNewBucket(data[4][newKey], coord[1], coord[2], GetCoordGridForZone(newKey))
                     end
                     data[4][oldKey] = nil
                     zonesFixed = zonesFixed + 1
@@ -2954,19 +3040,17 @@ function QuestieLearner:InjectLearnedData()
     -- coordinates. The explicit/learned spawn paths are already isolated by
     -- spawnSource and the real kill/object evidence now carries its own tag.
 
-    -- Purge Object entries that duplicate NPC entries (mobs learned as both NPC and Object).
-    -- NPC data is richer (has names, quest IDs), so keep the NPC version and remove the Object.
-    local dupObjectsRemoved = 0
-    for objId, _ in pairs(learned.objects) do
-        if learned.npcs[objId] then
-            learned.objects[objId] = nil
-            dupObjectsRemoved = dupObjectsRemoved + 1
-            Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] Removed duplicate Object", objId, "(NPC version exists)")
-        end
-    end
-    if dupObjectsRemoved > 0 then
-        Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] Removed", dupObjectsRemoved, "Object entries that duplicate NPC entries")
-    end
+    -- REMOVED: a rule that deleted learned.objects[id] whenever learned.npcs[id]
+    -- existed, on the theory that the object was a mob mistakenly learned twice.
+    -- Creature and GameObject entry IDs are SEPARATE, heavily overlapping ID spaces --
+    -- the shipped WotLK database has 1867 ids that are both. For example id 31 is the
+    -- NPC 'Furbolg' and also the object "Old Lion Statue", which starts quests
+    -- {248,249} and ends quest {94}. Under the old rule, learning the Furbolg silently
+    -- deleted a learned quest-giver object on the next InjectLearnedData.
+    --
+    -- If a mob really is being learned as both an NPC and an object, fix that where it
+    -- is learned (the unitType branches in OnMouseoverUnit / OnTargetChanged /
+    -- OnGossipShow), never by id collision here.
 
     -- 1. NPCs
     local npcIdsToFix = {}
@@ -3226,7 +3310,7 @@ function QuestieLearner:InjectLearnedData()
                 for zoneId, coords in pairs(data[4]) do
                     existing[4][zoneId] = existing[4][zoneId] or {}
                     for _, coord in ipairs(coords) do
-                        InsertIfNewBucket(existing[4][zoneId], coord[1], coord[2])
+                        InsertIfNewBucket(existing[4][zoneId], coord[1], coord[2], GetCoordGridForZone(zoneId))
                     end
                 end
             end
@@ -3330,8 +3414,6 @@ local HEX_PREFIXES = {
     ["F110"] = "Creature",
     ["F111"] = "Creature",
 }
-
-local CREATURE_HEX_PREFIXES = { ["F130"]=true, ["F131"]=true, ["F110"]=true, ["F111"]=true }
 
 local function _GetDashGuidField(guid, index)
     if not guid or type(guid) ~= "string" or index <= 0 then return nil end
@@ -3484,6 +3566,52 @@ local function NpcFlagsHasQuestGiver(flags)
     return math.mod(math.floor(flags / NPC_FLAG_QUESTGIVER), 2) == 1
 end
 
+-- Is this NPC a quest giver we should record coordinates for?
+--
+-- UnitNPCFlags does NOT exist on 3.3.5a -- confirmed nil in game -- so the live
+-- bitmask is simply unavailable and NpcFlagsHasQuestGiver(0) is always false. The
+-- old fallback then read QuestieDB.npcData, but QuestieCleanup:Run() nils that
+-- during init (QuestieInit.lua:360), long before any mouseover fires. Both gates
+-- were therefore permanently false and mouseover/target quest-giver learning never
+-- ran at all on this client.
+--
+-- QueryNPCSingle survives cleanup (it reads the compiled stream), returns nil
+-- quietly for unknown ids rather than logging like GetNPC, and folds in override
+-- data -- so learner- and AscensionDB-discovered quest givers count too.
+local function _IsQuestGiverNpc(unit, npcId)
+    if UnitNPCFlags and unit then
+        local liveFlags = UnitNPCFlags(unit)
+        if liveFlags and NpcFlagsHasQuestGiver(liveFlags) then
+            return true
+        end
+    end
+
+    if npcId and npcId > 0 and QuestieDB and QuestieDB.QueryNPCSingle then
+        -- npcKeys.npcFlags (15) carries the same bitmask the client will not give us.
+        local dbFlags = QuestieDB.QueryNPCSingle(npcId, "npcFlags")
+        if dbFlags and NpcFlagsHasQuestGiver(dbFlags) then
+            return true
+        end
+        local starts = QuestieDB.QueryNPCSingle(npcId, "questStarts")
+        if type(starts) == "table" and next(starts) then return true end
+        local ends = QuestieDB.QueryNPCSingle(npcId, "questEnds")
+        if type(ends) == "table" and next(ends) then return true end
+    end
+
+    -- On a custom server the static DB often has no record, and the gossip/turn-in
+    -- paths are what taught us this NPC in the first place.
+    return (HasQuestNpcGiverReferences and HasQuestNpcGiverReferences(npcId)) or false
+end
+
+-- Exposed so the behaviour is testable and reusable: whether an NPC counts as a
+-- quest giver is decided in exactly one place.
+---@param unit string|nil  a unit token, or nil to consult the databases only
+---@param npcId number
+---@return boolean
+function QuestieLearner:IsQuestGiverNpc(unit, npcId)
+    return _IsQuestGiverNpc(unit, npcId)
+end
+
 function QuestieLearner:OnMouseoverUnit()
     if not UnitExists("mouseover") or not UnitIsVisible("mouseover") then return end
     if UnitIsPlayer("mouseover") then return end
@@ -3509,21 +3637,9 @@ function QuestieLearner:OnMouseoverUnit()
     _NoteUnitCreatureType("mouseover", entityId)
     if IsCritterNpc(entityId) then return end
 
-    -- Only learn this NPC if it carries the questgiver flag OR if it is already
-    -- known in the database as a starter/finisher (so we can update its coords).
-    local npcFlags = UnitNPCFlags and UnitNPCFlags("mouseover") or 0
-    local isQuestGiver = NpcFlagsHasQuestGiver(npcFlags)
-
-    if not isQuestGiver then
-        -- Silently check raw table — do NOT call GetNPC which logs CRITICAL for every miss
-        local rawNpc = QuestieDB and QuestieDB.npcData and QuestieDB.npcData[entityId]
-        if rawNpc and (rawNpc[10] or rawNpc[11]) then
-            -- known quest starter (key 10) or quest ender (key 11)
-            isQuestGiver = true
-        end
-    end
-
-    if not isQuestGiver then return end
+    -- Only learn this NPC if it is a quest giver, so we can keep its coords fresh.
+    if not _IsQuestGiverNpc("mouseover", entityId) then return end
+    local npcFlags = (UnitNPCFlags and UnitNPCFlags("mouseover")) or 0
 
     local level = UnitLevel("mouseover")
     local zoneText = GetRealZoneText()
@@ -3547,7 +3663,7 @@ function QuestieLearner:OnMouseoverUnit()
     end
 
     _Learner.guidNpcCache = _Learner.guidNpcCache or {}
-    _Learner.guidNpcCache[guid] = { npcId = npcId, name = name, ts = time() }
+    _Learner.guidNpcCache[guid] = { npcId = entityId, name = name, ts = time() }
 
     -- Pass areaId as spawnZoneId so LearnNPC stores spawn data under the
     -- correct areaId (3430 for Sunstrider/Eversong) rather than falling back
@@ -3588,15 +3704,8 @@ function QuestieLearner:OnTargetChanged()
     -- Learn this NPC's spawn if it is a quest giver/turn-in NPC (mirrors OnMouseoverUnit).
     -- Targeting a turn-in NPC should record its location so the finisher '?' can draw, even
     -- when UPDATE_MOUSEOVER_UNIT didn't fire for it (e.g. it was click- or tab-targeted).
-    local npcFlags = UnitNPCFlags and UnitNPCFlags("target") or 0
-    local isQuestGiver = NpcFlagsHasQuestGiver(npcFlags)
-    if not isQuestGiver then
-        local rawNpc = QuestieDB and QuestieDB.npcData and QuestieDB.npcData[entityId]
-        if rawNpc and (rawNpc[10] or rawNpc[11]) then -- known quest starter (10) or ender (11)
-            isQuestGiver = true
-        end
-    end
-    if isQuestGiver then
+    local npcFlags = (UnitNPCFlags and UnitNPCFlags("target")) or 0
+    if _IsQuestGiverNpc("target", entityId) then
         local subName = UnitCreatureFamily and UnitCreatureFamily("target") or nil
         -- nil coords -> LearnNPC falls back to the player's position (we're at the NPC).
         self:LearnNPC(entityId, name, level, subName, npcFlags, nil, nil, nil, nil)
@@ -3605,7 +3714,8 @@ end
 
 -- Collects all available quest data from the quest detail/offer screen (before accepting)
 function QuestieLearner:OnQuestDetail()
-    local questId = GetQuestID and GetQuestID()
+    -- true = quest STARTER frame (QUEST_DETAIL is the offer screen), matching QuestieAuto:193.
+    local questId = GetQuestID and GetQuestID(true)
     if not questId or questId <= 0 then return end
 
     local data = {}
@@ -3644,7 +3754,8 @@ function QuestieLearner:OnQuestDetail()
 end
 
 function QuestieLearner:OnQuestComplete()
-    local questId = GetQuestID and GetQuestID()
+    -- false = turn-in frame, not the offer screen.
+    local questId = GetQuestID and GetQuestID(false)
     if not questId or questId <= 0 then return end
 
     _Learner.lastQuestComplete = {
@@ -3656,10 +3767,15 @@ function QuestieLearner:OnQuestComplete()
     -- Get current zone for quest giver spawn data
     local zoneId = GetZoneId()
 
-    -- Capture completion/finish text
+    -- Capture completion/finish text under a named key, NOT a numeric one. This used to write
+    -- data[18], but the quest schema has no slot for reward text at all -- see QuestieDB.questKeys
+    -- in Database/questDB.lua, where 18 is requiredSkill and is declared {skill(int), value(int)}.
+    -- Every turn-in was therefore stamping prose into a field other code expects to be a table.
+    -- A non-numeric key rides along in the record and is ignored by the database adapter, which
+    -- reads the numeric schema only.
     local data = {}
     if GetRewardText then
-        data[18] = GetRewardText()
+        data.rewardText = GetRewardText()
     end
     self:LearnQuest(questId, data)
 
@@ -3808,16 +3924,35 @@ function QuestieLearner:OnQuestAccepted(firstArg, secondArg)
     -- Similarly, requiredLevel is not exposed by GetQuestLogLeaderBoard on 3.3.5.
     local data = {}
     local logIdx = 0
-    for i = 1, GetNumQuestLogEntries() do
-        local title, level, suggestedGroup, isHeader, _, _, _, id = QuestieCompat.GetQuestLogTitle(i)
-        if not isHeader and id == questId then
-            data[1] = title
-            -- [5] questLevel: level returned by GetQuestLogTitle IS the quest's own level
-            data[5] = level and level > 0 and level or nil
-            logIdx = i
-            break
+    local leaderBoard = {}
+    -- Expanded for the read: accepting a quest whose header happens to be collapsed otherwise finds
+    -- no row for it at all -- a collapsed header removes its quests from this index space -- and the
+    -- record is written with neither a name nor a level, which first-write-wins then makes hard to
+    -- repair. The collapse state is restored on the way out.
+    QuestieCompat.WithFullQuestLog(function()
+        for i = 1, GetNumQuestLogEntries() do
+            local title, level, suggestedGroup, isHeader, _, _, _, id = QuestieCompat.GetQuestLogTitle(i)
+            if not isHeader and id == questId then
+                data[1] = title
+                -- [5] questLevel: level returned by GetQuestLogTitle IS the quest's own level
+                data[5] = level and level > 0 and level or nil
+                logIdx = i
+                break
+            end
         end
-    end
+
+        -- The objective lines are read here too, not further down. A quest log index only means
+        -- anything while the log is in the state it was read in, and putting the player's collapsed
+        -- headers back renumbers every row below them -- so carrying logIdx out of this block would
+        -- read some other quest's leaderboard.
+        if logIdx > 0 then
+            local numObj = GetNumQuestLeaderBoards and GetNumQuestLeaderBoards(logIdx) or 0
+            for j = 1, numObj do
+                local objText, objType, finished = GetQuestLogLeaderBoard(j, logIdx)
+                leaderBoard[j] = { text = objText, type = objType, finished = finished }
+            end
+        end
+    end)
 
     -- [17] zoneOrSort: areaId from current zone name. This is the correct
     -- field for zone storage (was previously incorrectly written as [8] which
@@ -3832,21 +3967,13 @@ function QuestieLearner:OnQuestAccepted(firstArg, secondArg)
 
     self:LearnQuest(questId, data)
 
-    -- Proactively map objectives based on quest log text
-    if logIdx == 0 then
-        for i = 1, GetNumQuestLogEntries() do
-            local _, _, _, isHeader, _, _, _, id = QuestieCompat.GetQuestLogTitle(i)
-            if not isHeader and id == questId then
-                logIdx = i
-                break
-            end
-        end
-    end
-
-    if logIdx > 0 then
-        local numObj = GetNumQuestLeaderBoards and GetNumQuestLeaderBoards(logIdx) or 0
-        for j = 1, numObj do
-            local objText, objType, finished = GetQuestLogLeaderBoard(j, logIdx)
+    -- Proactively map objectives, from the lines captured above. The re-scan that used to sit here
+    -- for the logIdx == 0 case is gone: the pass above already searched the whole log with every
+    -- header expanded, so a quest it could not find is not in the log at all.
+    do
+        for j = 1, #leaderBoard do
+            local entry = leaderBoard[j]
+            local objText, objType, finished = entry.text, entry.type, entry.finished
             if objText and not finished and (objType == "monster" or objType == "killcredit" or objType == "object") then
                 local targetName = objText:match("^%d+/%d+%s+(.+)%s*") or objText:match("^(.+):%s*%d+/%d+")
                 if not targetName then
@@ -4007,6 +4134,9 @@ function QuestieLearner:OnQuestTurnedIn(questId, xpReward, moneyReward)
         end
     end
     self:LearnQuest(questId, data)
+    -- Return the RESOLVED id so the event dispatcher can clear objective tracking
+    -- for it. The raw QUEST_TURNED_IN arg is not always the quest id.
+    return questId
 end
 
 -- Loot handler with async GetItemInfo retry
@@ -4068,9 +4198,9 @@ function QuestieLearner:OnLootOpened()
             if link then
                 local itemId = tonumber(string.match(link, "item:(%d+)"))
                 if itemId and itemId > 0 then
-                    local itemName, _, _, itemLevel, requiredLevel, _, _, _, _, _, _, itemClassId, itemSubClassId = GetItemInfo(link)
+                    local itemName, _, _, itemLevel, requiredLevel, itemType, _, _, _, _, _, itemClassId, itemSubClassId = GetItemInfo(link)
                     if itemName then
-                        local learnedItem = self:LearnItem(itemId, itemName, itemLevel, requiredLevel, itemClassId, itemSubClassId)
+                        local learnedItem = self:LearnItem(itemId, itemName, itemLevel, requiredLevel, itemClassId, itemSubClassId, itemType)
                         if learnedItem and npcId then self:LearnItemDrop(itemId, npcId) end
                         if learnedItem and objectId then
                             self:LearnObject(objectId, nil, nil, nil, GetZoneId(), true)
@@ -4174,9 +4304,9 @@ function QuestieLearner:OnGetItemInfoReceived(itemId)
     local remaining = {}
     for _, entry in ipairs(_Learner.pendingItemLinks) do
         if entry.itemId == itemId then
-            local itemName, _, _, itemLevel, requiredLevel, _, _, _, _, _, _, itemClassId, itemSubClassId = GetItemInfo(entry.link)
+            local itemName, _, _, itemLevel, requiredLevel, itemType, _, _, _, _, _, itemClassId, itemSubClassId = GetItemInfo(entry.link)
             if itemName then
-                local learnedItem = self:LearnItem(itemId, itemName, itemLevel, requiredLevel, itemClassId, itemSubClassId)
+                local learnedItem = self:LearnItem(itemId, itemName, itemLevel, requiredLevel, itemClassId, itemSubClassId, itemType)
                 if learnedItem and entry.npcId then self:LearnItemDrop(itemId, entry.npcId) end
                 if learnedItem and entry.objectId then
                     self:LearnObject(entry.objectId, nil, nil, nil, GetZoneId(), true)
@@ -5070,19 +5200,35 @@ end
 function QuestieLearner:RegisterEvents()
     local frame = CreateFrame("Frame", "QuestieLearnerFrame")
 
-    frame:RegisterEvent("UPDATE_MOUSEOVER_UNIT")
-    frame:RegisterEvent("PLAYER_TARGET_CHANGED")
-    frame:RegisterEvent("QUEST_DETAIL")
-    frame:RegisterEvent("QUEST_COMPLETE")
-    frame:RegisterEvent("QUEST_TURNED_IN")
-    frame:RegisterEvent("QUEST_ACCEPTED")
-    frame:RegisterEvent("LOOT_OPENED")
-    frame:RegisterEvent("GOSSIP_SHOW")
-    frame:RegisterEvent("GAMEOBJECT_USED")
-    frame:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-    frame:RegisterEvent("GET_ITEM_INFO_RECEIVED")
-    frame:RegisterEvent("UNIT_QUEST_LOG_CHANGED")
-    frame:RegisterEvent("QUEST_REMOVED")
+    -- Register defensively. Several of these are not stock 3.3.5a events
+    -- (GAMEOBJECT_USED, QUEST_TURNED_IN, QUEST_REMOVED, GET_ITEM_INFO_RECEIVED appear
+    -- nowhere in the 3.3.5 FrameXML) and exist only if the server's client adds them.
+    -- Registering them in a bare sequence means one unknown name aborts the rest --
+    -- and GAMEOBJECT_USED sat directly before COMBAT_LOG_EVENT_UNFILTERED, so a throw
+    -- there would silently take out kill learning, the learner's main data source.
+    -- Isolate each one; a missing event should cost only its own feature.
+    local events = {
+        "UPDATE_MOUSEOVER_UNIT",
+        "PLAYER_TARGET_CHANGED",
+        "QUEST_DETAIL",
+        "QUEST_COMPLETE",
+        "QUEST_TURNED_IN",
+        "QUEST_ACCEPTED",
+        "LOOT_OPENED",
+        "GOSSIP_SHOW",
+        "GAMEOBJECT_USED",
+        "COMBAT_LOG_EVENT_UNFILTERED",
+        "GET_ITEM_INFO_RECEIVED",
+        "UNIT_QUEST_LOG_CHANGED",
+        "QUEST_REMOVED",
+    }
+    for _, event in ipairs(events) do
+        local ok = pcall(frame.RegisterEvent, frame, event)
+        if not ok then
+            Questie:Debug(Questie.DEBUG_INFO,
+                "[QuestieLearner] Event not available on this client:", event)
+        end
+    end
 
     frame:SetScript("OnEvent", function(_, event, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9, arg10)
         if event == "UPDATE_MOUSEOVER_UNIT" then
@@ -5094,7 +5240,12 @@ function QuestieLearner:RegisterEvents()
         elseif event == "QUEST_COMPLETE" then
             self:OnQuestComplete()
         elseif event == "QUEST_TURNED_IN" then
-            self:OnQuestTurnedIn(arg1, arg2, arg3)
+            -- Clear objective tracking here too. This used to be handled only by the
+            -- unreachable "or event == QUEST_TURNED_IN" clause below, which this branch
+            -- always shadowed, leaving prevObjCounts to leak on servers that do not
+            -- fire QUEST_REMOVED reliably (see QuestEventHandler.lua:678).
+            local turnedInId = self:OnQuestTurnedIn(arg1, arg2, arg3)
+            self:ClearQuestObjectiveTracking(turnedInId or arg1)
         elseif event == "QUEST_ACCEPTED" then
             self:OnQuestAccepted(arg1, arg2)
         elseif event == "LOOT_OPENED" then
@@ -5112,7 +5263,7 @@ function QuestieLearner:RegisterEvents()
             self:OnGetItemInfoReceived(arg1)
         elseif event == "UNIT_QUEST_LOG_CHANGED" then
             self:OnQuestLogUpdate()
-        elseif event == "QUEST_REMOVED" or event == "QUEST_TURNED_IN" then
+        elseif event == "QUEST_REMOVED" then
             self:ClearQuestObjectiveTracking(arg1)
         end
     end)
@@ -5152,17 +5303,68 @@ function QuestieLearner:Initialize()
     Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] Initialized")
 end
 
-function QuestieLearner:ScanExistingQuestLog()
+-- Records a quest that is in the player's log but absent from the static database.
+--
+-- Scoped that way deliberately: the shipped database already describes stock quests, and copying it
+-- into saved variables would grow the file and every export bundle for nothing. A quest with no row
+-- of its own comes back from GetQuest as a log fallback -- or as nothing at all -- and that is the
+-- signal used here rather than a second membership test of its own.
+---@return boolean @true when a record was written
+local function _LearnQuestFromLog(self, questId, title, level)
+    if not (title and title ~= "") then return false end
+
+    local known = QuestieDB and QuestieDB.GetQuest and QuestieDB.GetQuest(questId)
+    if known and (not known._isLogFallback) then return false end
+
+    -- Already recorded with a name, so leave it alone: the confidence counter should count
+    -- sightings of the quest, not logins.
+    local existing = Questie.dbLearner.global.quests[questId]
+    if existing and existing[QuestieDB.questKeys.name] then return false end
+
+    local data = {}
+    data[QuestieDB.questKeys.name] = title
+    if level and level > 0 then
+        data[QuestieDB.questKeys.questLevel] = level
+    end
+
+    -- The zone comes from the header the client filed the quest under, NOT from GetRealZoneText.
+    -- OnQuestAccepted can read the player's position because the player is standing at the quest
+    -- giver when it fires; at login they may be anywhere, and stamping the login spot onto every
+    -- quest would teach the database something false. A header that resolves to no area -- the
+    -- "Missing header!" bucket a custom sort id lands in -- leaves the field unset rather than
+    -- guessing at it.
+    local header = QuestLogCache and QuestLogCache.GetHeader and QuestLogCache.GetHeader(questId)
+    if header and header ~= "" and l10n and l10n.GetAreaIdByLocalName then
+        local areaId = l10n:GetAreaIdByLocalName(header)
+        if areaId and areaId > 0 then
+            data[QuestieDB.questKeys.zoneOrSort] = areaId
+        end
+    end
+
+    self:LearnQuest(questId, data)
+    return true
+end
+
+local function ScanExistingQuestLog(self)
     if not self:IsEnabled() then return end
     if not Questie.dbLearner.global.settings.learnQuests then return end
     if not GetNumQuestLogEntries then return end
 
     Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] Scanning existing quest log...")
     local count = 0
+    local learned = 0
 
     for i = 1, GetNumQuestLogEntries() do
         local title, level, _, isHeader, _, _, _, questId = QuestieCompat.GetQuestLogTitle(i)
         if not isHeader and questId and questId > 0 then
+            -- Learn the quest itself. Every other path into LearnQuest fires at the moment of
+            -- accepting or turning in, so a quest that was already in the log when the addon first
+            -- loaded -- which is all of a custom server's content on an established character --
+            -- had never been seen by the learner at all.
+            if _LearnQuestFromLog(self, questId, title, level) then
+                learned = learned + 1
+            end
+
             -- Check if this quest needs objective mapping
             local existingData = Questie.dbLearner.global.quests[questId]
             local needsMapping = not existingData or not existingData.objIndex or not next(existingData.objIndex)
@@ -5227,10 +5429,26 @@ function QuestieLearner:ScanExistingQuestLog()
         end
     end
 
-    if count > 0 then
+    if count > 0 or learned > 0 then
         self:InjectLearnedData()
-        Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] Scanned existing quest log, mapped", count, "objectives")
+        Questie:Debug(Questie.DEBUG_INFO, "[QuestieLearner] Scanned existing quest log, mapped", count,
+            "objectives and learned", learned, "quest(s) missing from the database")
     end
+
+    return learned
+end
+
+--- Learns every quest already in the player's log that the static database does not describe, and
+--- maps what objectives it can. Runs once shortly after login.
+function QuestieLearner:ScanExistingQuestLog()
+    -- Expanded first. A collapsed quest log header takes its quests out of the index space this
+    -- walk uses, and a custom server's own content is exactly what tends to sit under one -- on
+    -- 3.3.5 an unresolvable sort id lands the whole group under the client's "Missing header!"
+    -- bucket. Forced past the throttle because this is the login read: it has to see the whole log
+    -- even when the player logged in with headers shut, and it only happens once.
+    return QuestieCompat.WithFullQuestLog(function()
+        return ScanExistingQuestLog(self)
+    end, true)
 end
 
 ------------------------------------------------------------------------
@@ -5384,6 +5602,15 @@ end
 function QuestieLearner:_ApplyIncomingNetworkMerge(typ, id, d, op)
     if not typ or not id or not d then return false end
 
+    -- Coerce and bound-check the id before it is ever used as a store key. Comms
+    -- passed payload.id through untouched (QuestieLearnerComms:ProcessRawMessage),
+    -- so a peer could write an arbitrary key -- a string, a float, a negative -- into
+    -- the player's saved learner data. The import path already did this check
+    -- (QuestieLearnerExport MergeType); the broadcast path did not.
+    id = tonumber(id)
+    if not id or id <= 0 or id ~= floor(id) then return false end
+    if type(d) ~= "table" then return false end
+
     local store
     if typ == "NPC" then
         if not Questie.dbLearner.global.settings.learnNpcs then return false end
@@ -5415,7 +5642,9 @@ function QuestieLearner:_ApplyIncomingNetworkMerge(typ, id, d, op)
 
     local existing = store[id]
     if not existing then
-        store[id] = d
+        -- Store a copy, not the peer's table, so nothing outside the learner keeps a
+        -- live reference into the player's SavedVariables.
+        store[id] = DeepCopy(d)
         store[id].mc = 1
         if typ == "NPC" and type(d[1]) == "string" and d[1] ~= "" then
             _MarkNpcNameIndexDirty()
@@ -5439,11 +5668,14 @@ function QuestieLearner:_ApplyIncomingNetworkMerge(typ, id, d, op)
     local coordKey = (typ == "NPC") and 7 or (typ == "OBJECT" and 4 or nil)
     if coordKey and type(d[coordKey]) == "table" then
         existing[coordKey] = existing[coordKey] or {}
-        local grid = GetCustomGridPrecision()
         for zoneId, coords in pairs(d[coordKey]) do
             -- Defensive: skip malformed zone keys / coord lists rather than erroring.
             if type(zoneId) == "number" and type(coords) == "table" then
                 existing[coordKey][zoneId] = existing[coordKey][zoneId] or {}
+                -- Grid must come from the zone the coordinates BELONG to, not from
+                -- wherever the local player happens to be standing. Incoming merges
+                -- carry data for arbitrary zones.
+                local grid = GetCoordGridForZone(zoneId)
                 for _, coord in ipairs(coords) do
                     if type(coord) == "table" and type(coord[1]) == "number" and type(coord[2]) == "number" then
                         if InsertIfNewBucket(existing[coordKey][zoneId], coord[1], coord[2], grid) then

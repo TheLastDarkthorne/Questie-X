@@ -11,7 +11,14 @@ local AceComm = LibStub("AceComm-3.0")
 
 local addonPrefix = "QuestieLearner"
 local hiddenChannelName = "questiecomm"
-local ProtocolVersion = 2 -- Increment protocol version for enhanced/sanitized data
+local ProtocolVersion = 3 -- v3: real AceSerializer payloads (v2 emitted a table address, never valid data)
+
+-- SendChatMessage truncates at 255 characters (FrameXML ChatFrameEditBoxTemplate
+-- letters="255"). A truncated payload fails DecodeForPrint on every receiver, so
+-- an oversized broadcast is worse than no broadcast: it burns a rate-limit token
+-- and makes every peer log a decode failure. Drop it instead, and let the entry
+-- travel via the export/import string, which has no length ceiling.
+local MAX_CHAT_PAYLOAD = 240 -- 255 minus headroom for channel/sender framing
 
 local time = time
 local GetTime = GetTime
@@ -169,15 +176,19 @@ function QuestieLearnerComms:Initialize()
         QuestieLearnerComms:OnCommReceived(prefix, message, distribution, sender)
     end)
     
-    -- Setup Hidden Channel
-    local channelId, channelName = GetChannelName(hiddenChannelName)
-    if channelId == 0 then
-        JoinPermanentChannel(hiddenChannelName, nil, DEFAULT_CHAT_FRAME:GetID(), 1)
-        ChatFrame_RemoveChannel(DEFAULT_CHAT_FRAME, hiddenChannelName)
-        DebugLog("CRITICAL", "Joined hidden data-sharing channel: " .. hiddenChannelName)
+    -- Setup Hidden Channel. Only when comms are actually enabled: the client has a
+    -- hard cap on joined channels, and joining one the player has switched off spends
+    -- a slot for nothing.
+    if GetCommsTuning() then
+        local channelId = GetChannelName(hiddenChannelName)
+        if channelId == 0 then
+            JoinPermanentChannel(hiddenChannelName, nil, DEFAULT_CHAT_FRAME:GetID(), 1)
+            ChatFrame_RemoveChannel(DEFAULT_CHAT_FRAME, hiddenChannelName)
+            DebugLog("CRITICAL", "Joined hidden data-sharing channel: " .. hiddenChannelName)
+        end
+        -- Cache for use in ProcessQueues (avoids GetChannelName every tick)
+        _hiddenChannelId = GetChannelName(hiddenChannelName) or 0
     end
-    -- Cache for use in ProcessQueues (avoids GetChannelName every tick)
-    _hiddenChannelId = GetChannelName(hiddenChannelName) or 0
 
     -- Process incoming/outgoing queues 
     QuestieCompat.C_Timer.NewTicker(0.5, function() _QuestieLearnerComms:ProcessQueues() end)
@@ -243,6 +254,14 @@ function QuestieLearnerComms:BroadcastLearnedData(op, entityType, entityId, data
     local compressed = LibDeflate:CompressDeflate(serialized, {level = 1})
     local encoded = LibDeflate:EncodeForPrint(compressed)
 
+    -- Oversized entries (many spawns, or [8] GUID evidence) cannot survive one
+    -- chat message. Skip rather than send a payload every receiver will reject.
+    if string.len(encoded) > MAX_CHAT_PAYLOAD then
+        DebugLog("DEVELOP", "Skipping oversized " .. tostring(entityType) .. " " .. tostring(entityId)
+            .. " (" .. string.len(encoded) .. " > " .. MAX_CHAT_PAYLOAD .. " chars)")
+        return
+    end
+
     -- 3. Broadcast (Token Bucket logic handled in QueueMessage)
     _QuestieLearnerComms:QueueMessage(encoded)
 end
@@ -283,6 +302,13 @@ function _QuestieLearnerComms:ProcessQueues()
         -- Use cached channel ID; refresh lazily if 0 (e.g. after disconnect)
         if _hiddenChannelId == 0 then
             _hiddenChannelId = GetChannelName(hiddenChannelName) or 0
+            -- Initialize only joins when comms are on. If the player enabled them
+            -- afterwards we are not in the channel yet, so join on first send.
+            if _hiddenChannelId == 0 then
+                JoinPermanentChannel(hiddenChannelName, nil, DEFAULT_CHAT_FRAME:GetID(), 1)
+                ChatFrame_RemoveChannel(DEFAULT_CHAT_FRAME, hiddenChannelName)
+                _hiddenChannelId = GetChannelName(hiddenChannelName) or 0
+            end
         end
         if _hiddenChannelId > 0 then
             SendChatMessage(msg, "CHANNEL", nil, _hiddenChannelId)
@@ -329,16 +355,22 @@ end
 function _QuestieLearnerComms:ProcessRawMessage(encodedMsg, sender)
     if not IsSenderTrusted(sender) then return end
 
+    -- NOTE: malformed input is NOT a strike. The questiecomm channel carries chat
+    -- from anything that joins it, and during a version rollover older clients still
+    -- broadcast the previous format. Striking on decode/parse failure made peers mute
+    -- (3 strikes) and permanently ban (7) each other for traffic nobody chose to send.
+    -- Only the spam check in IsSenderTrusted still records strikes.
+
     -- 1. Decode & Decompress
     local compressed = LibDeflate:DecodeForPrint(encodedMsg)
     if not compressed then
-        RecordStrike(sender, "Invalid Base64 Encoding")
+        DebugLog("DEVELOP", "Undecodable message from " .. tostring(sender) .. " -- ignored")
         return 
     end
 
     local serialized = LibDeflate:DecompressDeflate(compressed)
     if not serialized then 
-        RecordStrike(sender, "Decompression Failed")
+        DebugLog("DEVELOP", "Undecompressable message from " .. tostring(sender) .. " -- ignored")
         return 
     end
 
@@ -348,7 +380,7 @@ function _QuestieLearnerComms:ProcessRawMessage(encodedMsg, sender)
     -- 2. Deserialize
     local success, payload = AceSerializer:Deserialize(serialized)
     if not success or type(payload) ~= "table" then
-        RecordStrike(sender, "Deserialization Failed")
+        DebugLog("DEVELOP", "Unparsable message from " .. tostring(sender) .. " -- ignored")
         return
     end
 

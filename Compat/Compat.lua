@@ -588,6 +588,118 @@ function QuestieCompat.GetQuestLogTitle(questLogIndex)
     return questTitle, level, questTag, isHeader, isCollapsed, isComplete, isDaily and 2 or 1, questID
 end
 
+-- Collapsing a quest log header takes its quests out of the index space that
+-- GetNumQuestLogEntries and GetQuestLogTitle walk. Blizzard's own QuestLog_Update draws every
+-- index straight through with no collapse test of its own, and QuestLog_OpenToQuest has to call
+-- ExpandQuestHeader(0) before it can address a quest by index -- so a collapsed header's quests
+-- are genuinely unreachable, not merely unlisted. Every walk of the log in this addon is
+-- therefore reading a partial log whenever a header is shut, and anything that reads "absent
+-- from the walk" as "the player no longer has it" will throw those quests away.
+
+-- Titles of the headers that are collapsed right now, in log order.
+local function GetCollapsedQuestHeaders()
+    local collapsed, count = {}, 0
+    local numEntries = (GetNumQuestLogEntries and select(1, GetNumQuestLogEntries())) or 0
+
+    for i = 1, numEntries do
+        local title, _, _, isHeader, isCollapsed = QuestieCompat.GetQuestLogTitle(i)
+        if isHeader and isCollapsed and title and title ~= "" then
+            count = count + 1
+            collapsed[count] = title
+        end
+    end
+
+    return collapsed, count
+end
+
+--- True when the quest log holds quests that no index walk can currently reach.
+--- Callers that delete state for quests they cannot find MUST check this first.
+---@return boolean
+function QuestieCompat.IsQuestLogPartial()
+    local _, count = GetCollapsedQuestHeaders()
+    return count > 0
+end
+
+--- The collapsed header titles as a lookup, for callers that must decide, per quest, whether its
+--- absence from the index space is explained by a shut header or means the quest is really gone.
+--- The bare partial/not-partial answer is too coarse for that: it would spare every quest in the
+--- log because one unrelated header happens to be closed.
+---@return table<string, boolean> lookup, number count
+function QuestieCompat.GetCollapsedHeaderLookup()
+    local collapsed, count = GetCollapsedQuestHeaders()
+    local lookup = {}
+    for i = 1, count do
+        lookup[collapsed[i]] = true
+    end
+    return lookup, count
+end
+
+local function PackResults(...)
+    return { n = select("#", ...), ... }
+end
+
+local inFullQuestLogScan = false
+local lastFullQuestLogScan -- nil until the first pass, so that one is never throttled
+-- Expanding and re-collapsing fires QUEST_LOG_UPDATE twice, and the scans that ask for a full log
+-- arrive in bursts -- three per looted batch. A quest behind a shut header updating half a second
+-- late costs nothing; doubling the event rate for as long as the header stays shut does.
+local FULL_SCAN_THROTTLE = 0.5
+
+--- Runs fn with every quest log header expanded, then puts the collapse state back exactly as it
+--- was, so the log's indices -- and any selection resting on them -- end up where they started.
+--- When nothing is collapsed, or when a throttled call comes too soon after the last one, this is
+--- just a call to fn on the log as it stands.
+---
+--- Only safe from paths that are not themselves driven by QUEST_LOG_UPDATE: the expand and the
+--- collapse each fire one, so a caller that runs on every such event would drive itself in a loop.
+---@param fn function
+---@param force boolean? @bypass the throttle, for the login read that has to see the whole log
+function QuestieCompat.WithFullQuestLog(fn, force)
+    if inFullQuestLogScan or type(ExpandQuestHeader) ~= "function" or type(CollapseQuestHeader) ~= "function" then
+        return fn()
+    end
+
+    local collapsed, count = GetCollapsedQuestHeaders()
+    if count == 0 then
+        return fn()
+    end
+
+    local now = (GetTime and GetTime()) or 0
+    if (not force) and lastFullQuestLogScan and (now - lastFullQuestLogScan) < FULL_SCAN_THROTTLE then
+        return fn()
+    end
+    lastFullQuestLogScan = now
+
+    inFullQuestLogScan = true
+    ExpandQuestHeader(0)
+
+    -- pcall so a fault in fn cannot leave the player's quest log expanded behind it. The result
+    -- count is carried alongside because a nil among the returns would cut a plain unpack short.
+    local results = PackResults(pcall(fn))
+
+    -- Restore. The log is re-walked for each header because collapsing one renumbers every row
+    -- below it, and matched by title because the index it had before the expand is long gone.
+    for i = 1, count do
+        local wanted = collapsed[i]
+        local numEntries = (select(1, GetNumQuestLogEntries())) or 0
+        for index = 1, numEntries do
+            local title, _, _, isHeader, isCollapsed = QuestieCompat.GetQuestLogTitle(index)
+            if isHeader and (not isCollapsed) and title == wanted then
+                CollapseQuestHeader(index)
+                break
+            end
+        end
+    end
+
+    inFullQuestLogScan = false
+
+    if not results[1] then
+        error(results[2], 0)
+    end
+
+    return unpack(results, 2, results.n)
+end
+
 local MAX_QUEST_LOG_INDEX = 75
 -- Returns the current quest log index of a quest by its ID.
 -- https://wowpedia.fandom.com/wiki/API_GetQuestLogIndexByID

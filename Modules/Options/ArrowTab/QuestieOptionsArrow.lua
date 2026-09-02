@@ -91,6 +91,21 @@ function QuestieOptions.tabs.arrow:Initialize()
                     end
                 end,
             },
+            arrowHideInInstances = {
+                type = "toggle",
+                order = 2.5,
+                width = 1.5,
+                name = function() return l10n("Hide In Instances") end,
+                desc = function() return l10n("When this is checked, the arrow is hidden and stops scanning for targets while you are inside a dungeon, raid, battleground or arena.") end,
+                disabled = function() return Questie.db.profile.arrowEnabled == false end,
+                get = function() return Questie.db.profile.arrowHideInInstances ~= false end,
+                set = function(_, value)
+                    Questie.db.profile.arrowHideInInstances = value
+                    if QuestieArrow and QuestieArrow.Refresh then
+                        QuestieArrow:Refresh()
+                    end
+                end,
+            },
             arrow_spacer_1 = QuestieOptionsUtils:Spacer(3),
             arrowStyle = {
                 type = "select",

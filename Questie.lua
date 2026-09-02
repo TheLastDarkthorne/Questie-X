@@ -132,8 +132,17 @@ end
 
 local orig_Print = Questie.Print
 
+-- Print is what the slash commands answer the player with, so it has to reach the chat frame
+-- whatever the debug settings are. It used to forward to Questie:Debug, which returns immediately
+-- unless debugEnabled AND debugEnabledPrint are both on and the level bit matches -- and both
+-- default to false. Every user-facing message in the addon was therefore swallowed: asking for
+-- "/questie learn stats" simply printed nothing at all.
 function Questie:Print(...)
-    Questie:Debug(Questie.DEBUG_INFO, ...)
+    if orig_Print then
+        orig_Print(Questie, ...)
+    else
+        print(...)
+    end
 end
 
 function Questie:Error(...)

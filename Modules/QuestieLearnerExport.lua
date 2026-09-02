@@ -502,11 +502,19 @@ function _Export:RunPrune(dryRun)
             return "unconfirmed and stale (> " .. thresholdDays .. " days)"
         end
         if pruneVerified or not isVerified then
-            if QuestieDB and QuestieDB.GetQuest then
-                local dbEntry = QuestieDB.GetQuest(id)
-                if dbEntry and (entry.mc or 0) < 2 then
-                    return "fully covered by official DB, mc < 2"
-                end
+            -- Ask the STATIC store, not QuestieDB.GetQuest. GetQuest deliberately falls
+            -- back to the learner record and to questDataOverrides (QuestieDB.lua, the
+            -- 'rawdata = learnerRecord' / 'rawdata = overrideData' branches), so every
+            -- learner-only quest looked "covered by the official DB" and got pruned --
+            -- deleting exactly the data the learner exists to collect.
+            -- QuestPointers is the compiled static index; unlike QuerySingle/GetQuest it
+            -- is not consulted through the override layer (compiler.lua GetDBHandle sets
+            -- handle.pointers before overrides are applied). Same idiom as
+            -- QuestieComms.lua:610 and AvailableQuests.lua:238.
+            local staticIndex = QuestieDB and (QuestieDB.QuestPointers or QuestieDB.questData)
+            local coveredByStaticDB = staticIndex ~= nil and staticIndex[id] ~= nil
+            if coveredByStaticDB and (entry.mc or 0) < 2 then
+                return "fully covered by official DB, mc < 2"
             end
         end
         return nil
@@ -557,6 +565,23 @@ function _Export:RunPrune(dryRun)
     PruneStore(bucket.quests,  ShouldPruneQuest,  "quests")
     PruneStore(bucket.items,   ShouldPruneItem,   "items")
     PruneStore(bucket.objects, ShouldPruneObject, "objects")
- 
+
+    -- Removing an entry from the learner store is only half the job: InjectLearnedData
+    -- has already copied it into QuestieDB.*DataOverrides, and nothing here cleared
+    -- those. Pruned pins therefore stayed on the map until the next /reload, making
+    -- Prune look like it had done nothing. Rebuild the override layer from what
+    -- actually survived. ApplyDataSourceMode restores the static snapshot first, so
+    -- entries that were pruned do not linger.
+    if (not dryRun) and result.total > 0 then
+        local QuestieLearner = QuestieLoader:ImportModule("QuestieLearner")
+        if QuestieLearner and QuestieLearner.ApplyDataSourceMode then
+            pcall(QuestieLearner.ApplyDataSourceMode, QuestieLearner)
+        end
+        local QuestieQuest = QuestieLoader:ImportModule("QuestieQuest")
+        if QuestieQuest and QuestieQuest.SmoothReset then
+            pcall(QuestieQuest.SmoothReset, QuestieQuest)
+        end
+    end
+
     return result
 end

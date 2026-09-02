@@ -1692,11 +1692,15 @@ function QuestieQuest:PopulateObjective(quest, objectiveIndex, objective, blockI
                 and (dataSourceMode == "auto" or dataSourceMode == "learner") then
             local zone, _ = next(zones)
             while zone do
-                local suppressed = (objectiveData.Type == "monster" and QuestieDB.GetSuppressedNPCs(zone)) or (objectiveData.Type == "object" and QuestieDB.GetSuppressedObjects(zone))
-                if suppressed then
+                -- Ask per id rather than building the whole suppressed set for the zone:
+                -- the set builders scan every learned entity, and only these few ids are
+                -- ever looked up. See QuestieDB.IsNPCSuppressed.
+                local isSuppressed = (objectiveData.Type == "monster" and QuestieDB.IsNPCSuppressed)
+                    or (objectiveData.Type == "object" and QuestieDB.IsObjectSuppressed)
+                if isSuppressed then
                     local id, spawnData = next(objective.spawnList)
                     while id do
-                        if suppressed[id] and spawnData.Spawns and spawnData.Spawns[zone] then
+                        if spawnData.Spawns and spawnData.Spawns[zone] and isSuppressed(id, zone) then
                             -- Only suppress if this isn't a learned spawn (learned spawns have .isLearned)
                             if not spawnData.isLearned then
                                 -- Never suppress AscensionDB-owned spawns — these are hand-curated

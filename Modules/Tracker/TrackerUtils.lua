@@ -28,6 +28,8 @@ local ZoneDB = QuestieLoader:ImportModule("ZoneDB")
 local QuestieArrow = QuestieLoader:ImportModule("QuestieArrow")
 ---@type l10n
 local l10n = QuestieLoader:ImportModule("l10n")
+---@type QuestLogCache
+local QuestLogCache = QuestieLoader:ImportModule("QuestLogCache")
 
 --- COMPATIBILITY ---
 local C_Timer = QuestieCompat.C_Timer
@@ -689,6 +691,16 @@ local questLogQuestIds = {}
 -- instead of another walk. Verified before use, since the log renumbers on every change.
 local questLogIndexes = {}
 
+-- True when the last walk could not reach every quest the player has, because the client had a
+-- header collapsed. Everything read from that walk is then a subset, not the whole log.
+local questLogIsPartial = false
+
+-- What QuestLogCache last read with the log fully expanded. Guarded because the tracker can be
+-- asked to draw before that module has finished loading.
+local function GetCachedQuestLog()
+    return QuestLogCache.questLog_DO_NOT_MODIFY or {}
+end
+
 local function BuildQuestLogHeaders()
     local headers = {}
     local questIds = {}
@@ -706,6 +718,23 @@ local function BuildQuestLogHeaders()
             indexes[logId] = i
             if header then
                 headers[logId] = header
+            end
+        end
+    end
+
+    questLogIsPartial = QuestieCompat.IsQuestLogPartial()
+
+    if questLogIsPartial then
+        -- A quest under a collapsed header is still the player's, it is just not addressable by
+        -- index right now. QuestLogCache last read it with the log fully expanded, so take the
+        -- quest and its header from there rather than reporting it gone. No index: there isn't
+        -- one to have, and every caller already handles that by keeping what it last read.
+        for questId, data in pairs(GetCachedQuestLog()) do
+            if not questIds[questId] then
+                questIds[questId] = true
+                if data.header then
+                    headers[questId] = data.header
+                end
             end
         end
     end
@@ -795,6 +824,48 @@ local function ReadFallbackObjectives(questLogIndex, questId, objectives)
     return objectives
 end
 
+-- Same fill, from QuestLogCache instead of the live log. Used for a quest sitting under a
+-- collapsed header: the client will not hand out a log index for it, but the cache holds what the
+-- last fully expanded walk read, which is the same data one step staler.
+local function ReadCachedObjectives(cached, questId, objectives)
+    local cachedObjectives = (cached and cached.objectives) or {}
+    local count = #cachedObjectives
+
+    for j = 1, count do
+        local cachedObjective = cachedObjectives[j]
+        local objective = objectives[j]
+        if not objective then
+            objective = {}
+            objectives[j] = objective
+        end
+
+        local needed = cachedObjective.numRequired
+        if type(needed) ~= "number" or needed <= 0 then
+            needed = 1
+        end
+        local collected = cachedObjective.numFulfilled
+        if type(collected) ~= "number" then
+            collected = cachedObjective.finished and needed or 0
+        end
+
+        objective.questId = questId
+        objective.Index = j
+        objective.Description = cachedObjective.text
+        objective.text = cachedObjective.raw_text or cachedObjective.text
+        objective.Collected = collected
+        objective.Needed = needed
+        objective.Completed = (cachedObjective.finished or collected >= needed) and true or false
+        objective.baseType = cachedObjective.type
+        objective.Type = "fallback"
+    end
+
+    for j = #objectives, count + 1, -1 do
+        objectives[j] = nil
+    end
+
+    return objectives
+end
+
 -- Returns the header title string, or nil if the quest is not in the log under one.
 local function GetQuestLogZoneName(questId)
     if not questLogQuestIds[questId] then
@@ -871,6 +942,23 @@ local function _GetZoneName(zoneOrSort, questId, zoneNameOverride)
     return zoneName
 end
 
+--- The tracker group a quest is filed under, as the string the draw actually uses.
+---
+--- Exposed because Questie.db.char.collapsedZones is keyed by this name, and anything that wants to
+--- ask or change a zone's collapsed state has to arrive at the identical string. AQW_Insert used to
+--- index that table with quest.zoneOrSort -- a number -- so its attempt to un-collapse a zone when a
+--- quest was re-tracked could never match a key and silently did nothing.
+--- questId is taken separately because a quest object can reach the tracker without a usable Id --
+--- a partial override record, a slot holding the bare id -- and the log-header lookup inside needs
+--- the real one to find the group the client filed the quest under.
+---@param quest table
+---@param questId number?
+---@return string?
+function TrackerUtils:GetZoneNameForQuest(quest, questId)
+    if not quest then return nil end
+    return _GetZoneName(quest.zoneOrSort, questId or quest.Id, quest.zoneNameOverride)
+end
+
 -- The client's own title for a quest, or nil if the player does not have it. Quest objects can
 -- reach the tracker without a usable name -- a questDataOverrides entry that carries no name
 -- field, a QuestLogCache row read before the client had filled the title in -- and since those
@@ -910,7 +998,22 @@ function TrackerUtils:RefreshFallbackQuest(quest)
     if not quest then return false end
 
     local questLogIndex = GetQuestLogIndexForQuest(quest.Id)
-    if not questLogIndex then return false end
+    if not questLogIndex then
+        -- No index means one of two things, and they need opposite answers: the player dropped the
+        -- quest, or the client has its header collapsed and will not address it. The cache is what
+        -- tells them apart, and on the second it also carries the state to refresh from.
+        local cached = GetCachedQuestLog()[quest.Id]
+        if not cached then return false end
+
+        if cached.title and cached.title ~= "" then
+            quest.name = cached.title
+        end
+        quest.logIsComplete = cached.isComplete
+        quest.isComplete = (cached.isComplete == 1)
+        ReadCachedObjectives(cached, quest.Id, quest.Objectives)
+
+        return true
+    end
 
     local title, level, _, _, _, isComplete = GetQuestLogTitle(questLogIndex)
     if title and title ~= "" then
@@ -931,17 +1034,24 @@ end
 -- Returns nil if the quest is not currently in the quest log.
 function TrackerUtils:BuildFallbackQuest(questId)
     local questLogIndex = GetQuestLogIndexForQuest(questId)
-    if not questLogIndex then return nil end
+    local cached = GetCachedQuestLog()[questId]
+    if (not questLogIndex) and (not cached) then return nil end
 
     -- Walk backwards from the quest in the log to find the zone header.
     -- This is the canonical 3.3.5 method: zone headers sit above their quests.
+    -- A quest with no index is behind a collapsed header, so the walk cannot reach either it or
+    -- its header; the cache recorded that header the last time the log was read in full.
     local zoneText = nil
-    for h = questLogIndex, 1, -1 do
-        local hTitle, _, _, hIsHeader = GetQuestLogTitle(h)
-        if hIsHeader and hTitle and hTitle ~= "" then
-            zoneText = hTitle
-            break
+    if questLogIndex then
+        for h = questLogIndex, 1, -1 do
+            local hTitle, _, _, hIsHeader = GetQuestLogTitle(h)
+            if hIsHeader and hTitle and hTitle ~= "" then
+                zoneText = hTitle
+                break
+            end
         end
+    else
+        zoneText = cached.header
     end
     local zoneId = (zoneText and GetAreaIdByZoneName(zoneText)) or 0
     local zoneNameOverride = nil
@@ -983,7 +1093,10 @@ function TrackerUtils:GetSortedQuestIds()
     -- log is the authority on what the player still has, so anything missing from it is skipped.
     -- Skipped rather than pruned: a redraw that catches the log mid-refresh would otherwise throw
     -- away state Questie is about to want back.
-    local questLogIsReadable = next(questLogQuestIds) ~= nil
+    -- A walk that could not reach every quest cannot answer "does the player still have this?".
+    -- The merge in BuildQuestLogHeaders covers the quests QuestLogCache knows about; anything
+    -- else keeps its place in the tracker until the log can be read in full again.
+    local questLogIsReadable = (next(questLogQuestIds) ~= nil) and (not questLogIsPartial)
     -- Update quest objectives
 
     for questId, quest in pairs(QuestiePlayer.currentQuestlog) do
@@ -1075,7 +1188,7 @@ function TrackerUtils:GetSortedQuestIds()
             -- Create questDetails table keys and insert values
             questDetails[qid] = {}
             questDetails[qid].quest = quest
-            questDetails[qid].zoneName = _GetZoneName(quest.zoneOrSort, qid, quest.zoneNameOverride)
+            questDetails[qid].zoneName = TrackerUtils:GetZoneNameForQuest(quest, qid)
 
             if quest:IsComplete() == 1 or (not next(quest.Objectives)) then
                 questDetails[qid].questCompletePercent = 1

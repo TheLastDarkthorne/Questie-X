@@ -28,6 +28,370 @@ local function _fmt(v)
     return tostring(v)
 end
 
+
+-- A scrollable, selectable text window. WoW addons cannot write files, so a report that is
+-- meant to leave the game has to be presented somewhere the player can Ctrl+A / Ctrl+C it --
+-- chat mangles long lines and drops the ones that scroll past.
+local copyBox
+local function _ShowCopyWindow(title, text)
+    if not copyBox then
+        copyBox = CreateFrame("Frame", "QuestieCopyBoxFrame", UIParent)
+        copyBox:SetSize(720, 520)
+        copyBox:SetPoint("CENTER")
+        copyBox:SetFrameStrata("DIALOG")
+        copyBox:SetBackdrop({
+            bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
+            edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+            tile = true, tileSize = 32, edgeSize = 32,
+            insets = { left = 11, right = 12, top = 12, bottom = 11 },
+        })
+        copyBox:SetMovable(true)
+        copyBox:EnableMouse(true)
+        copyBox:RegisterForDrag("LeftButton")
+        copyBox:SetScript("OnDragStart", copyBox.StartMoving)
+        copyBox:SetScript("OnDragStop", copyBox.StopMovingOrSizing)
+
+        copyBox.title = copyBox:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+        copyBox.title:SetPoint("TOP", copyBox, "TOP", 0, -16)
+
+        copyBox.hint = copyBox:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+        copyBox.hint:SetPoint("TOPLEFT", copyBox, "TOPLEFT", 20, -36)
+        copyBox.hint:SetText("Text is already selected -- press Ctrl+C to copy (Ctrl+A reselects). Esc closes.")
+
+        local close = CreateFrame("Button", nil, copyBox, "UIPanelCloseButton")
+        close:SetPoint("TOPRIGHT", copyBox, "TOPRIGHT", -6, -6)
+
+        local scroll = CreateFrame("ScrollFrame", "QuestieCopyBoxScroll", copyBox,
+            "UIPanelScrollFrameTemplate")
+        scroll:SetPoint("TOPLEFT", copyBox, "TOPLEFT", 20, -54)
+        scroll:SetPoint("BOTTOMRIGHT", copyBox, "BOTTOMRIGHT", -38, 20)
+
+        local edit = CreateFrame("EditBox", nil, scroll)
+        edit:SetMultiLine(true)
+        edit:SetAutoFocus(false)
+        edit:SetFontObject(ChatFontNormal)
+        -- Both caps default to a few hundred on a fresh EditBox, which silently truncates a
+        -- report of any size. 0 means no limit.
+        edit:SetMaxLetters(0)
+        edit:SetMaxBytes(0)
+        -- Height 1: a multiline EditBox grows its own height to fit the text, and the scroll
+        -- range follows from that. Same pattern as QuestieDebugOffer.
+        edit:SetSize(640, 1)
+        edit:SetScript("OnEscapePressed", function() copyBox:Hide() end)
+        scroll:SetScrollChild(edit)
+        copyBox.edit = edit
+
+        -- Lets Esc close it the way every other panel closes.
+        if UISpecialFrames then
+            table.insert(UISpecialFrames, "QuestieCopyBoxFrame")
+        end
+    end
+
+    copyBox.title:SetText(title)
+    copyBox.edit:SetText(text)
+    copyBox.edit:SetCursorPosition(0)
+    copyBox:Show()
+    copyBox.edit:SetFocus()
+    copyBox.edit:HighlightText()
+end
+
+-- Walks the player's actual quest log and reports, per quest, every stage between the client
+-- handing the quest over and the tracker drawing a line for it. Written because a quest sitting
+-- in the log with no line in the tracker can be dropped at any of six places, and guessing which
+-- one from the outside is hopeless.
+--
+-- Returns plain lines and a count. Plain on purpose: the text is meant to be copied out, and
+-- WoW colour escapes travel with it and make the paste unreadable.
+---@return table lines, number dropped
+local function _BuildQuestPipelineReport(onlyQuestId)
+    local QuestLogCache = QuestieLoader:ImportModule("QuestLogCache")
+    local TrackerUtils = QuestieLoader:ImportModule("TrackerUtils")
+    local QuestiePlayer = QuestieLoader:ImportModule("QuestiePlayer")
+    -- Module, not a global: referencing it bare reports nil for every learner field.
+    local QuestieLearner = QuestieLoader:ImportModule("QuestieLearner")
+    local GetQuestLogTitle = QuestieCompat.GetQuestLogTitle
+
+    local lines = {}
+    local function add(fmt, ...)
+        if select("#", ...) > 0 then
+            lines[#lines + 1] = string.format(fmt, ...)
+        else
+            lines[#lines + 1] = fmt
+        end
+    end
+
+    local drawn, details = {}, {}
+    local ok, sorted, questDetails = pcall(function()
+        return TrackerUtils:GetSortedQuestIds()
+    end)
+    if ok and sorted then
+        for _, qid in pairs(sorted) do drawn[qid] = true end
+        details = questDetails or {}
+    else
+        add("GetSortedQuestIds FAILED: %s", tostring(sorted))
+    end
+
+    local profile = Questie.db and Questie.db.profile or {}
+    local char = Questie.db and Questie.db.char or {}
+
+    add("Questie quest log pipeline")
+    add("Questie %s, client %s, locale %s", QuestieLib:GetAddonVersionString(),
+        tostring(GetBuildInfo()), tostring(GetLocale()))
+    -- Both returns of GetNumQuestLogEntries. The second is meant to count every quest the log
+    -- holds whether or not its header is collapsed, and the retry that repairs a partial login read
+    -- depends on that being true -- so it is worth seeing what this client actually reports.
+    do
+        local entries, quests = GetNumQuestLogEntries()
+        add("GetNumQuestLogEntries: entries=%s quests=%s", tostring(entries), tostring(quests))
+    end
+    add("autoTrackQuests=%s showCompleteQuests=%s trackerEnabled=%s partialLog=%s",
+        tostring(profile.autoTrackQuests), tostring(profile.trackerShowCompleteQuests),
+        tostring(profile.trackerEnabled),
+        tostring(QuestieCompat.IsQuestLogPartial and QuestieCompat.IsQuestLogPartial()))
+    add("learner enabled=%s live=%s mode=%s",
+        tostring(QuestieLearner and QuestieLearner.IsEnabled and QuestieLearner:IsEnabled()),
+        tostring(QuestieLearner and QuestieLearner.IsLearnerLiveEnabled
+            and QuestieLearner:IsLearnerLiveEnabled()),
+        tostring(QuestieLearner and QuestieLearner.GetDataSourceMode
+            and QuestieLearner:GetDataSourceMode()))
+
+    -- Reported here as well as by "/questie learn stats", because Questie:Print used to be routed
+    -- through the debug gate and answered that command with silence.
+    if QuestieLearner and QuestieLearner.GetStats then
+        local okStats, npcs, quests, items, objects = pcall(function()
+            return QuestieLearner:GetStats()
+        end)
+        if okStats then
+            add("learned so far: %s quest(s), %s npc(s), %s item(s), %s object(s)",
+                tostring(quests), tostring(npcs), tostring(items), tostring(objects))
+        else
+            add("learned so far: GetStats failed -- %s", tostring(npcs))
+        end
+    end
+
+    -- The reconciliation passes run from QUEST_LOG_UPDATE, where 3.3.5 discards Lua errors
+    -- unseen. Without these counters "the pass never ran", "it ran and threw" and "it ran and
+    -- found nothing to do" all look the same from here.
+    do
+        local QuestEventHandler = QuestieLoader:ImportModule("QuestEventHandler")
+        local stats = QuestEventHandler and QuestEventHandler.reconcileStats
+        if stats then
+            add("reconcile: QLU=%s cleanupRuns=%s registerRuns=%s lastAdded=%s totalAdded=%s",
+                tostring(stats.logUpdates), tostring(stats.cleanupRuns),
+                tostring(stats.registerRuns), tostring(stats.lastAdded),
+                tostring(stats.totalAdded))
+            add("           lastCacheCount=%s lastPartial=%s lastVetoedByLogWalk=%s",
+                tostring(stats.lastCacheCount), tostring(stats.lastPartial),
+                tostring(stats.lastVetoed))
+            if stats.cleanupError then add("  CLEANUP PASS THREW: %s", stats.cleanupError) end
+            if stats.registerError then add("  REGISTER PASS THREW: %s", stats.registerError) end
+        else
+            add("reconcile: no stats -- QuestEventHandler never loaded them")
+        end
+    end
+
+    local collapsedZoneNames = {}
+    if char.collapsedZones then
+        for zoneName, isCollapsed in pairs(char.collapsedZones) do
+            if isCollapsed then collapsedZoneNames[#collapsedZoneNames + 1] = tostring(zoneName) end
+        end
+    end
+    table.sort(collapsedZoneNames)
+    add("collapsed tracker zone groups: %s",
+        #collapsedZoneNames > 0 and table.concat(collapsedZoneNames, " | ") or "(none)")
+    add("")
+
+    local header, shown, dropped = nil, 0, 0
+    -- Expanded for the walk. Without this the report is blind to exactly the quests worth asking
+    -- about: a collapsed header takes its quests out of this index space, so asking after one by id
+    -- answered "not in your quest log" when it plainly was. The partialLog line above still reports
+    -- the real collapse state, because it was read before this ran.
+    QuestieCompat.WithFullQuestLog(function()
+    for i = 1, (GetNumQuestLogEntries() or 0) do
+        local title, level, questTag, isHeader, _, isComplete, _, questId = GetQuestLogTitle(i)
+        if isHeader then
+            header = title
+        elseif questId and questId > 0 then
+            local detail = details[questId]
+            local zone = detail and detail.zoneName
+            local zoneCollapsed = zone and char.collapsedZones and char.collapsedZones[zone]
+            -- A quest can be in the draw list, pass every filter, and still never appear: if it
+            -- throws while its line is being built the tracker skips it and moves on, and the error
+            -- goes to Questie:Error, which the debug gate swallows. Counted as not visible, or the
+            -- report would file it as fine and never print the reason.
+            local drawError = QuestieTracker and QuestieTracker.lastDrawErrors
+                and QuestieTracker.lastDrawErrors[questId]
+            local visible = drawn[questId] and not zoneCollapsed and not drawError
+            if not visible then dropped = dropped + 1 end
+
+            -- With no id, only the quests that fail to produce a line are worth printing --
+            -- a full log is twenty quests of five lines each and buries the answer.
+            if onlyQuestId == questId or ((not onlyQuestId) and not visible) then
+                shown = shown + 1
+
+                local slot = QuestiePlayer.currentQuestlog and QuestiePlayer.currentQuestlog[questId]
+                local slotKind = "MISSING"
+                if type(slot) == "table" then
+                    slotKind = slot._isLogFallback and "table(logFallback)" or "table"
+                elseif slot ~= nil then
+                    slotKind = "id-only(" .. type(slot) .. ")"
+                end
+
+                local dbQuest = QuestieDB.GetQuest and QuestieDB.GetQuest(questId)
+                local dbKind = "nil"
+                if dbQuest then dbKind = dbQuest._isLogFallback and "logFallback" or "real" end
+
+                local learned = Questie.dbLearner and Questie.dbLearner.global
+                    and Questie.dbLearner.global.quests and Questie.dbLearner.global.quests[questId]
+
+                add("[%d] %s", questId, tostring(title))
+                add("    header=%s", tostring(header))
+                add("    log: level=%s tag=%s isComplete=%s",
+                    tostring(level), tostring(questTag), tostring(isComplete))
+                add("    QuestLogCache=%s currentQuestlog=%s GetQuest=%s fallbackObj=%s",
+                    tostring((QuestLogCache.questLog_DO_NOT_MODIFY or {})[questId] ~= nil),
+                    slotKind, dbKind,
+                    tostring(TrackerUtils._fallbackQuests
+                        and TrackerUtils._fallbackQuests[questId] ~= nil))
+                -- GetAllQuestIds sets this the one time it walks a quest whose GetQuest is
+                -- nil. True while currentQuestlog is MISSING means the rebuild reached the
+                -- quest and something removed it after; false means it never got there.
+                add("    sessionWarning=%s", tostring(Questie._sessionWarnings
+                    and Questie._sessionWarnings[questId] ~= nil))
+                add("    learner=%s override=%s markedComplete=%s autoUntracked=%s tracked=%s hidden=%s",
+                    tostring(learned ~= nil),
+                    tostring(QuestieDB.questDataOverrides
+                        and QuestieDB.questDataOverrides[questId] ~= nil),
+                    tostring(char.complete and char.complete[questId] ~= nil),
+                    tostring(char.AutoUntrackedQuests and char.AutoUntrackedQuests[questId] ~= nil),
+                    tostring(char.TrackedQuests and char.TrackedQuests[questId] ~= nil),
+                    tostring(char.hidden and char.hidden[questId] ~= nil))
+
+                if drawError then
+                    add("    THREW WHILE DRAWING: %s", tostring(drawError))
+                end
+
+                if not drawn[questId] then
+                    add("    VERDICT: dropped before the tracker draw list")
+                else
+                    add("    draw list: yes, zone=%s", tostring(zone))
+                    add("    zoneCollapsed=%s questCollapsed=%s",
+                        tostring(zoneCollapsed and true or false),
+                        tostring(char.collapsedQuests
+                            and char.collapsedQuests[questId] and true or false))
+
+                    local q = detail and detail.quest
+                    local complete = q and q.IsComplete and q:IsComplete()
+                    local passesGate
+                    if profile.autoTrackQuests then
+                        passesGate = (complete ~= 1 or profile.trackerShowCompleteQuests)
+                            and not (char.AutoUntrackedQuests and char.AutoUntrackedQuests[questId])
+                    else
+                        passesGate = (char.TrackedQuests and char.TrackedQuests[questId]) and true or false
+                    end
+
+                    if drawError then
+                        add("    VERDICT: reached the draw and threw, so no line was made for it")
+                    elseif zoneCollapsed then
+                        add("    VERDICT: hidden, its zone group is collapsed in the tracker")
+                    elseif not passesGate then
+                        add("    VERDICT: hidden by the track/complete gate (complete=%s)",
+                            tostring(complete))
+                    else
+                        add("    VERDICT: should be visible")
+                    end
+                end
+                add("")
+            end
+        end
+    end
+    end, true)
+
+    if shown == 0 then
+        if onlyQuestId then
+            add("quest %s is not in your quest log", tostring(onlyQuestId))
+        else
+            add("every quest in your log reaches the tracker -- nothing is being dropped")
+        end
+    end
+
+    return lines, dropped
+end
+
+local function _ReportQuestPipeline(onlyQuestId)
+    local lines, dropped = _BuildQuestPipelineReport(onlyQuestId)
+    _ShowCopyWindow("Questie: quest log pipeline", table.concat(lines, "\n"))
+    Questie:Print(string.format("Pipeline report opened -- %d quest(s) not reaching the tracker.",
+        dropped))
+end
+
+-- Re-runs the login rebuild of currentQuestlog and reports before/after. Splits the two reasons
+-- a quest can be missing from currentQuestlog: the rebuild never ran while the quest was in the
+-- cache (a repeat fixes it) versus the rebuild aborting partway (a repeat changes nothing, and
+-- whatever it threw is caught and shown here instead of vanishing into a muted error frame).
+local function _RebuildQuestLog()
+    local QuestiePlayer = QuestieLoader:ImportModule("QuestiePlayer")
+    local QuestLogCache = QuestieLoader:ImportModule("QuestLogCache")
+
+    local function count(t)
+        local n = 0
+        for _ in pairs(t or {}) do n = n + 1 end
+        return n
+    end
+
+    local cached = count(QuestLogCache.questLog_DO_NOT_MODIFY)
+    local before = count(QuestiePlayer.currentQuestlog)
+
+    -- Which ids the reconciliation pass should already have picked up. If any are listed here, that
+    -- pass either never ran or bailed on them, and the manual call below says which.
+    local gap = {}
+    for questId in pairs(QuestLogCache.questLog_DO_NOT_MODIFY or {}) do
+        if not QuestiePlayer.currentQuestlog[questId] then
+            gap[#gap + 1] = tostring(questId)
+        end
+    end
+    table.sort(gap)
+
+    -- Call the reconciliation directly. It runs on every QUEST_LOG_UPDATE, so by the time anyone
+    -- types this it should have nothing left to do -- anything it adds here is a pass that is not
+    -- being reached in the normal event flow, which is a different fault from the rebuild's.
+    local QuestEventHandler = QuestieLoader:ImportModule("QuestEventHandler")
+    local reconciled, reconcileErr = "not available"
+    if QuestEventHandler and QuestEventHandler.private
+        and QuestEventHandler.private.RegisterMissingQuestsFallback then
+        local rok, res = pcall(function()
+            return QuestEventHandler.private:RegisterMissingQuestsFallback()
+        end)
+        if rok then reconciled = tostring(res) else reconciled, reconcileErr = "ERRORED", res end
+    end
+    local afterReconcile = count(QuestiePlayer.currentQuestlog)
+
+    local ok, err = pcall(function() QuestieQuest:GetAllQuestIds() end)
+    local after = count(QuestiePlayer.currentQuestlog)
+
+    local out = {
+        "Forced rebuild of currentQuestlog",
+        string.format("QuestLogCache holds %d quest(s)", cached),
+        string.format("currentQuestlog before=%d", before),
+        string.format("in the cache but not in currentQuestlog: %s",
+            #gap > 0 and table.concat(gap, ", ") or "(none)"),
+        string.format("RegisterMissingQuestsFallback added %s -> currentQuestlog=%d%s",
+            reconciled, afterReconcile,
+            reconcileErr and ("  (" .. tostring(reconcileErr) .. ")") or ""),
+        string.format("after GetAllQuestIds=%d", after),
+        ok and "GetAllQuestIds completed without error"
+            or ("GetAllQuestIds ERRORED: " .. tostring(err)),
+        "",
+    }
+    local report = _BuildQuestPipelineReport(nil)
+    for k = 1, #report do out[#out + 1] = report[k] end
+
+    _ShowCopyWindow("Questie: forced rebuild", table.concat(out, "\n"))
+    Questie:Print(string.format("Rebuild: currentQuestlog %d -> %d (cache holds %d). %s",
+        before, after, cached, ok and "No error." or "ERRORED, see window."))
+end
+
+
 local function _dumpFrame(name, frame)
     if not frame then
         print(string.format("%s: nil", name))
@@ -277,6 +641,9 @@ function QuestieSlash.HandleCommands(input)
         print(Questie:Colorize("/questie version - " .. l10n("Prints Questie and client version info"), "yellow"));
         print(Questie:Colorize("/questie learn [toggle/stats/clear/export] - " .. l10n("Self-learning database: toggle on/off, view stats, clear data, or export"), "yellow"));
         print(Questie:Colorize("/questie arrow perf [start/stop/show/clear] - " .. "Arrow performance profiler: record, view, or clear timing data", "yellow"));
+        print(Questie:Colorize("/questie arrow why - " .. "Explain the arrow's current target and the quest state behind it", "yellow"));
+        print(Questie:Colorize("/questie why [questID] - " .. "Trace every quest in your log through to the tracker and show where it is dropped", "yellow"));
+        print(Questie:Colorize("/questie why rebuild - " .. "Force the login rebuild of the quest log and report what it changed", "yellow"));
         return;
     end
 
@@ -431,7 +798,16 @@ function QuestieSlash.HandleCommands(input)
         return
     end
 
-    -- /questie arrow perf [start|stop|show|clear]
+    -- /questie arrow perf [start|stop|show|clear] | /questie arrow why
+    if mainCommand == "why" then
+        if subCommand == "rebuild" then
+            _RebuildQuestLog()
+        else
+            _ReportQuestPipeline(tonumber(subCommand))
+        end
+        return
+    end
+
     if mainCommand == "arrow" then
         local QuestieArrow = QuestieLoader:ImportModule("QuestieArrow")
         if subCommand == "perf" then
@@ -441,8 +817,14 @@ function QuestieSlash.HandleCommands(input)
             else
                 Questie:Print("Arrow perf profiler not available.")
             end
+        elseif subCommand == "why" then
+            if QuestieArrow and QuestieArrow.PrintWhy then
+                QuestieArrow:PrintWhy()
+            else
+                Questie:Print("Arrow diagnostics not available.")
+            end
         else
-            Questie:Print("Usage: /questie arrow perf [start|stop|show|clear]")
+            Questie:Print("Usage: /questie arrow [perf [start|stop|show|clear] | why]")
         end
         return
     end

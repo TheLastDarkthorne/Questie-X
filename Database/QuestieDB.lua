@@ -1116,6 +1116,54 @@ function QuestieDB.IsParentQuestActive(parentID)
     return false
 end
 
+--- Is one entity suppressed in one zone? Same rule as the GetSuppressed*() set builders,
+--- asked for a single id.
+---
+--- PERFORMANCE: the set builders scan every learned NPC/object on each call, and
+--- PopulateObjective called them once per zone per objective -- O(zones x learned
+--- entities) on every redraw. But the caller only ever looks up ids that are already
+--- in objective.spawnList (a handful), so asking per id removes the scan entirely.
+--- Measured at 8000 learned NPCs, a busy redraw (60 lookups) cost ~220ms of pure
+--- scanning. No cache, so there is nothing to invalidate and nothing to go stale.
+---@param store table    ld.npcs or ld.objects
+---@param id number
+---@param zoneId number
+---@param spawnKey number  7 for NPCs, 4 for objects
+---@param altKey number    the other key, for legacy rows
+---@return boolean
+local function _IsEntitySuppressed(store, id, zoneId, spawnKey, altKey)
+    local ld = Questie.dbLearner and Questie.dbLearner.global
+    if not ld or not ld.settings or not ld.settings.enabled then return false end
+    local mode = ld.settings.dataSourceMode or "auto"
+    if mode ~= "auto" and mode ~= "learner" then return false end
+    if not store then return false end
+
+    local entry = store[id]
+    if not entry then return false end
+
+    local threshold = ld.settings.minConfidencePins or 2
+    if not entry.mc or entry.mc < threshold then return false end
+
+    local spawns = GetSpawnTable(entry, spawnKey, altKey)
+    return (spawns and spawns[zoneId]) ~= nil
+end
+
+---@param npcId number
+---@param zoneId number
+---@return boolean
+function QuestieDB.IsNPCSuppressed(npcId, zoneId)
+    local ld = Questie.dbLearner and Questie.dbLearner.global
+    return _IsEntitySuppressed(ld and ld.npcs, npcId, zoneId, 7, 4)
+end
+
+---@param objectId number
+---@param zoneId number
+---@return boolean
+function QuestieDB.IsObjectSuppressed(objectId, zoneId)
+    local ld = Questie.dbLearner and Questie.dbLearner.global
+    return _IsEntitySuppressed(ld and ld.objects, objectId, zoneId, 4, 7)
+end
+
 --- Returns a table of [npcId] = true for NPCs that have verified learned data (Confidence >= 2)
 --- in a specific zone. Used to hide static database spawns in favor of verified ones.
 ---@param zoneId number
@@ -1782,21 +1830,28 @@ function QuestieDB.GetQuest(questId, ...) -- /dump QuestieDB.GetQuest(867)
             if questId == 0 then
                 Questie:Error("[QuestieDB.GetQuest] rawdata is nil for questID:", questId)
             end
-            return nil
         end
         -- Build a minimal live-fallback quest from the quest log so the tracker still works.
-        -- The override that got us here is partial by nature -- a Learner record of a single
-        -- field, a correction -- but whatever it does carry beats guessing, and the quest object
-        -- built here is cached for the session, so anything left blank stays blank.
+        -- Whatever the override carries beats guessing, and the quest object built here is cached
+        -- for the session, so anything left blank stays blank.
+        --
+        -- This used to sit inside the branch above, reachable only when an override existed, so a
+        -- quest with no database row AND no override -- exactly what a custom server's own content
+        -- is -- returned nil here even though the client had just handed the whole quest over.
+        -- On a server whose database plugin writes an override for most stock quests, that made
+        -- the failure look like it only touched custom quests.
         local logEntry = QuestLogCache.GetQuest(questId)
         if not logEntry then return nil end
         local function NonEmpty(text)
             if text and text ~= "" then return text end
             return nil
         end
-        local overrideName = NonEmpty(overrideData[QuestieDB.questKeys.name])
-        local overrideLevel = overrideData[QuestieDB.questKeys.questLevel]
-        local overrideZone = overrideData[QuestieDB.questKeys.zoneOrSort]
+        -- There may be no override at all now that a quest with neither a database row nor an
+        -- override reaches this point, so every read of it has to tolerate its absence.
+        local override = overrideData or {}
+        local overrideName = NonEmpty(override[QuestieDB.questKeys.name])
+        local overrideLevel = override[QuestieDB.questKeys.questLevel]
+        local overrideZone = override[QuestieDB.questKeys.zoneOrSort]
         local cachedTitle = NonEmpty(logEntry.title)
         local liveTitle
         if (not overrideName) and (not cachedTitle) and GetQuestLogIndexByID and GetQuestLogTitle then
